@@ -1,4 +1,4 @@
- Publishes ghcr.io/<owner>/recommendarr:<tag> (linux/amd64 only; it runs solely on TrueNAS) Publishes ghcr.io/${{ github.repository }}:<tag> (linux/amd64 only; it runs solely on TrueNAS)
+# Publishes ghcr.io/<owner>/recommendarr:<tag> (linux/amd64 only; it runs solely on TrueNAS)
 # on every v* tag. Never tags `latest`: homelab-stacks pins tag@digest and Renovate bumps it.
 name: release
 
