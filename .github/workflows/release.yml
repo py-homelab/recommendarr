@@ -1,0 +1,35 @@
+# Publishes ghcr.io/pyarmak/recommendarr:<tag> (linux/amd64 only; it runs solely on TrueNAS)
+# on every v* tag. Never tags `latest`: homelab-stacks pins tag@digest and Renovate bumps it.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/pyarmak/recommendarr:${{ github.ref_name }}
+          provenance: false
+      - name: Digest
+        run: |
+          echo "ghcr.io/pyarmak/recommendarr:${{ github.ref_name }}@${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"

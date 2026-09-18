@@ -1,0 +1,10 @@
+# Pulled data and reports carry friends' Plex usernames and viewing history.
+data/
+reports/
+docs/research/samples/
+
+.env
+.envrc
+.venv/
+__pycache__/
+*.pyc

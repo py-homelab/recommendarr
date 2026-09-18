@@ -1,0 +1,18 @@
+[project]
+name = "recommendarr"
+version = "0.1.0"
+description = "Per-user recommendation engine for a Plex library, with an offline evaluation harness"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "requests>=2.32",
+    "pandas>=3.0.6",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
