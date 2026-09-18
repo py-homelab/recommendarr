@@ -170,7 +170,16 @@ Scorer contract (`harness/baselines.py`): a callable `(UserContext, items) -> {k
 over `ctx.candidates`, optional `prepare(contexts, items)` for cross-user state. New scorers
 are added to the list passed to `eval.run` and must clear the adoption rule in doc 04.
 
-## 7. The engine (built 2026-09-17)
+## 7. The engine (built 2026-09-17, **live since 2026-09-18**)
+
+Deployed as the `recommendarr` service in homelab-stacks' media stack (commits `9f17bd5`,
+`740d784`): image `ghcr.io/py-homelab/recommendarr:v0.1.0@sha256:9caa53ff…`, dataset
+`ssd-storage/configs/recommendarr` (568:568), `media-internal` only, read-only rootfs.
+picks reads it (`PICKS_ENGINE_URL=http://recommendarr:8090`, family titles hidden by
+default with a toggle) and falls back to Shortlist if the engine returns nothing; unsetting
+that variable is the rollback. picks `events`/`dismissals` rows carry `source='engine:v1'`
+for engine-served items. Releases: push a `v*` tag → GHCR image → Renovate opens (does not
+automerge) a pin-bump PR in homelab-stacks. Source: `github.com/py-homelab/recommendarr`.
 
 `engine/` is the service picks will read. `docs/results.md` holds every number behind it.
 

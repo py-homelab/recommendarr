@@ -159,3 +159,11 @@ browser-impersonating TLS fingerprints (curl_cffi chrome/safari/firefox) — so 
 header nor the client fingerprint is the discriminator. Pavel's reading of the GitHub
 threads: **Trakt now requires VIP for API access.** Decision (Pavel, 2026-09-17): **drop
 Trakt for good**; do not retry. `TRAKT_CLIENT_ID` in `.envrc` is unused and can be removed.
+
+## 2026-09-18 — deployed
+
+Engine v0.1.0 live behind picks for all users (homelab-stacks `740d784`). Verified on the
+NAS by the homelab-stacks session: healthy, 273 items for a non-admin user (27 family
+titles hidden by default), no fallbacks. From here on, `events` rows with
+`source='engine:v1'` accumulate; the next measurable step is the pooled swipe reranker and
+team-draft interleaving once a few hundred household labels exist.
