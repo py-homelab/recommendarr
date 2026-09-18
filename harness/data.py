@@ -115,10 +115,14 @@ def fold_contexts(con, items: dict[Key, Item], fold_id: int) -> dict[int, UserCo
     return _contexts(con, users, cutoff, universe)
 
 
-def holdout_contexts(con, items: dict[Key, Item], now: int) -> dict[int, UserContext]:
-    """Contexts for the secondary protocol: whole catalogue, library included; the user's
-    held-out positives are removed from their seeds."""
+def holdout_contexts(con, items: dict[Key, Item], now: int, library_only=False) -> dict[int, UserContext]:
+    """Contexts for the secondary protocol: whole catalogue, library included (or, with
+    library_only, exactly the Plex-row surface: library titles the user has not watched);
+    the user's held-out positives are removed from their seeds."""
     universe = {k for k, it in items.items() if it.in_catalogue}
+    if library_only:
+        library = {(r[0], r[1]) for r in con.execute("SELECT tmdb_id, media_type FROM library")}
+        universe = {k for k in items if k in library}
     users = [r["user_id"] for r in con.execute("SELECT user_id FROM users WHERE evaluated")]
     held = {}
     for r in con.execute("SELECT * FROM holdout"):

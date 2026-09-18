@@ -167,3 +167,39 @@ NAS by the homelab-stacks session: healthy, 273 items for a non-admin user (27 f
 titles hidden by default), no fallbacks. From here on, `events` rows with
 `source='engine:v1'` accumulate; the next measurable step is the pooled swipe reranker and
 team-draft interleaving once a few hundred household labels exist.
+
+## 2026-09-18 — the Plex-row surface (in-library ranking)
+
+Question from the homelab-stacks session: would Shortlist's rows benefit from the engine?
+
+**Protocol**: temporal holdout (each user's most recent 20% of positives by first
+engagement, ≤30 per medium), candidates = **library minus watched** (1,362–1,868 per user,
+exactly the row surface), 9 users. B1 is the harness's simulation of Shortlist's row
+ranking (same seeds/score/diversify as 1.8.0), not the delivered rows — those cannot be
+scored offline yet because they were built with the held-out titles already watched.
+
+| scorer | NDCG@50 movie | NDCG@50 show | recall@20 movie | recall@20 show | lift | Jaccard@50 |
+|---|---|---|---|---|---|---|
+| B1 Shortlist row ranking (sim) | 0.083 | 0.111 | 0.068 | 0.120 | 2.35 | 0.05 |
+| B2 global popularity | 0.060 | 0.091 | 0.062 | 0.129 | 1.24 | 0.74 |
+| B3 household popularity | 0.045 | 0.126 | 0.010 | 0.186 | 1.66 | 0.34 |
+| **shipped engine** | **0.178** | **0.249** | 0.094 | 0.232 | 5.95 | 0.03 |
+
+Paired vs B1: movies +0.094 [+0.037, +0.144] 8W/1L; shows +0.139 [+0.043, +0.236] 7W/2L.
+Recall@20 deltas are positive but their CIs include 0 (9 units). Personalisation lift 5.95:
+in-library, the engine's list is six times as predictive of its own user as of others.
+
+**Family pollution in the owner's live Shortlist rows (run 13 trace, read-only)**: 14 of his
+30 seeds are kids' titles (Bluey, Bluey Minisodes, Sesame Street, Cars 1–3, Bear in the Big
+Blue House, …). Delivered movie rows: "Movies you've already seen" 10/15 kids, "New Movies
+to try" 8/15, "Tonight's Movies" 4/10 — 22 of 40 movie picks (55%), 22 of 80 overall (28%).
+TV rows: 0 kids. So the defect is real and concentrated in the movie rows. (Cheapest
+stack-side mitigation without any engine work: Shortlist's per-user "don't seed" on those
+titles, or a Plex Home profile for the kids.)
+
+Engine readiness for rows: the same scorer ranks library-minus-watched today (this run).
+Row-specific gaps: a **rewatch** row is a different task (re-rank *watched* titles; not
+built); "unstarted only" rows need started-but-unfinished shows excluded (engagement label
+`neutral`); franchise continuation works unchanged; "next season" is Plex's own Continue
+Watching, not ours. Delivering into Plex is Shortlist's privacy machinery, which the engine
+does not have.
