@@ -41,11 +41,16 @@ def blend_grid():
         yield blend.Blend(c2, [1.0, 2.0, 1.0], continuations=True, media_mix=True, name=f"BL(show_pop={spp})")
 
 
-def final_blend():
-    return blend.Blend(
-        [graph.GraphPPR(), content.ContentSeedKNN(), movielens.MovieLensEASE()],
-        [1.0, 2.0, 1.0], continuations=True, media_mix=True, name="BL_final",
-    )
+def final_blend(embedding_space=None):
+    """The shipped ranker. With an embedding space (gemini-embedding-2 item vectors) a fourth
+    component joins for shows only, where it cleared the adoption rule (2026-09-17)."""
+    comps = [graph.GraphPPR(), content.ContentSeedKNN(), movielens.MovieLensEASE()]
+    weights = [1.0, 2.0, 1.0]
+    if embedding_space is not None:
+        comps.append(content.ContentSeedKNN(space=embedding_space, p=64))
+        weights = {"movie": [1.0, 2.0, 1.0, 0.0], "show": [1.0, 1.0, 1.0, 3.0]}
+    return blend.Blend(comps, weights, continuations=True, media_mix=True,
+                       name="BL_final" + ("_embed" if embedding_space is not None else ""))
 
 
 def signals_grid(con):

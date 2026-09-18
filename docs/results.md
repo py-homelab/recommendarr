@@ -115,3 +115,35 @@ Findings and decisions:
 Not run: LLM taste cards / reranker (no Gemini or OpenRouter key present); Trakt `related`
 edges (no client id); Plex watchlist (no Plex token); pooled swipe reranker (events table
 live since 2026-09-17, no data yet).
+
+## 2026-09-17 — LLM components (Gemini via OpenRouter; total spend $1.93)
+
+**E1 item embeddings** (`gemini-embedding-2`, 768 dims, text = title, year, type, genres,
+keyword names, certification, overview; 29,869 items, ~$1). As a drop-in content space
+with the TF-IDF settings it was bad (shows 0.021, lift 1.04): dense cosines bunch near 1
+and need a far sharper kernel. With sim^64 and m=10 on the tuning folds: movies 0.043,
+shows 0.048, show recall@100 0.145 (TF-IDF 0.090).
+
+As a **fourth blend component** (weight 3 next to graph 1 / TF-IDF 1 / EASE 1), paired vs
+the shipped blend:
+
+| | NDCG@50 movie Δ | NDCG@50 show Δ | recall@100 show Δ |
+|---|---|---|---|
+| all folds | −0.004 [−0.013, +0.007] | **+0.011 [+0.004, +0.018], 8W/0L** | +0.025 [−0.005, +0.076] |
+| test folds | −0.006 [−0.030, +0.020] | **+0.029 [+0.009, +0.049], 5W/0L** | +0.019 [+0.000, +0.048] |
+
+Decision: **adopted for shows only** (per-media weights: movies 1/2/1/0, shows 1/1/1/3).
+Shows NDCG 0.043 → 0.054, show recall@100 0.126 → 0.152, lift 1.85 → 2.02. Artefact
+`embeddings_gemini-embedding-2_768.npz` (92 MB) ships with the data; the nightly build
+embeds only new titles and skips them if no OPENROUTER_API_KEY is set. Gemini's own free
+tier (100 texts/min) is too slow for the catalogue; OpenRouter serves the same model.
+
+**E2 user-side reranker** (`gemini-3.8-flash` reranks the blend's top 60 from the user's
+60 most-engaged titles and abandonments; 93 calls, ~$0.90): movies +0.006 [−0.001, +0.012]
+all folds, +0.004 test; shows ±0. **Not adopted**: no reliable gain, and it would send
+every user's history to a third party nightly for nothing measurable. Revisit as a
+`why`-writer or with swipe labels, not as a ranker.
+
+**Dataset search** (see `docs/research/02`, last section): no open per-user TV dataset
+that joins to TMDb exists (MTS KION 2021 is the nearest; ContentWise is anonymised);
+MovieLens 32M (10/2023) remains the freshest open movie set. TV stays on graph + content.

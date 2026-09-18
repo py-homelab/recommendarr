@@ -26,10 +26,11 @@ class Blend:
     def __init__(self, components, weights=None, continuations=True, media_mix=True,
                  decade_gamma=0.0, continuation_bonus=0.1, continuation_min_rating=6.0, name=None):
         self.components = components
+        # weights: one list for both media, or {"movie": [...], "show": [...]}
         self.weights = weights or [1.0] * len(components)
         self.continuations, self.media_mix, self.decade_gamma = continuations, media_mix, decade_gamma
         self.continuation_bonus, self.continuation_min_rating = continuation_bonus, continuation_min_rating
-        tag = ",".join(f"{w:g}" for w in self.weights)
+        tag = ",".join(f"{w:g}" for w in self.weights) if isinstance(self.weights, list) else "per-media"
         self.name = name or f"BL_blend(w={tag},cont={int(continuations)},mix={int(media_mix)},dec={decade_gamma:g},cb={continuation_bonus:g})"
         self.last_continuations: dict[Key, Key] = {}
 
@@ -41,13 +42,15 @@ class Blend:
     def fused(self, ctx: UserContext, items: dict[Key, Item]) -> dict[Key, float]:
         total: dict[Key, float] = {}
         weight_sum: dict[Key, float] = {}
-        for comp, w in zip(self.components, self.weights):
-            if not w:
+        for ci, comp in enumerate(self.components):
+            per_media = self.weights if isinstance(self.weights, dict) else {"movie": self.weights, "show": self.weights}
+            if not any(per_media[mt][ci] for mt in per_media):
                 continue
             scores = comp(ctx, items)
             for mt in ("movie", "show"):
+                w = per_media[mt][ci]
                 keys = [k for k in scores if k[1] == mt]
-                if not keys:
+                if not keys or not w:
                     continue
                 for k, pct in percentiles(scores, keys).items():
                     total[k] = total.get(k, 0.0) + w * pct

@@ -61,19 +61,20 @@ class ItemSpace:
 class ContentSeedKNN:
     # Defaults chosen on folds 0-7 (2026-09-17): m=10, p=2 balances NDCG and recall@100;
     # negatives and cross-media seeding made no measurable difference at this stage.
-    def __init__(self, m=10, p=2.0, pop_power=1.0, negative_weight=0.5, cross_media=True, show_pop_power=None, name=None):
+    def __init__(self, m=10, p=2.0, pop_power=1.0, negative_weight=0.5, cross_media=True, show_pop_power=None, space=None, name=None):
         self.m, self.p, self.pop_power = m, p, pop_power
         self.show_pop_power = pop_power if show_pop_power is None else show_pop_power
         self.negative_weight, self.cross_media = negative_weight, cross_media
         self.name = name or f"C1_content_knn(m={m},p={p},pop={pop_power}/{self.show_pop_power},neg={negative_weight},x={int(cross_media)})"
-        self.space: ItemSpace | None = None
+        self.space = space
 
     def prepare(self, contexts, items: dict[Key, Item]) -> None:
         if self.space is None:
             self.space = ItemSpace(items)
 
     def _aggregate(self, cand_idx, seed_idx, weights) -> np.ndarray:
-        sims = (self.space.X[cand_idx] @ self.space.X[seed_idx].T).toarray()
+        sims = self.space.X[cand_idx] @ self.space.X[seed_idx].T
+        sims = sims.toarray() if sp.issparse(sims) else np.asarray(sims)
         sims = np.maximum(sims, 0) ** self.p * weights[None, :]
         m = min(self.m, sims.shape[1])
         top = np.partition(sims, -m, axis=1)[:, -m:] if sims.shape[1] > m else sims

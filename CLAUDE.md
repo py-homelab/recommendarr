@@ -64,7 +64,7 @@ below as Docker Compose projects.
 | **picks** (the PWA) | `truenas/media/picks.py` in homelab-stacks, ~1,200 lines, stdlib only, SQLite at `/data/picks.db` | Per-user deck + grid. See §4. **This is the consumer of whatever this engine produces.** |
 | **authentik** | `network` stack | Fronts picks; identity arrives as the Plex account id inside the `X-authentik-jwt` claim `ak_proxy.user_attributes.additionalHeaders["X-Plex-Account-Id"]`. Never trust a plain header. |
 | **TMDb** | API v3 | Shortlist and Kometa both hold a key; it is **not** in the sops files. Pavel approved reusing **Kometa's** key (its `config.yml` lives NAS-side at `KOMETA_CONFIG_PATH`, see `truenas/media/.env`); export it as `TMDB_API_KEY` in the shell. TMDb's terms cap response caching at 6 months (the harness cache has a 180-day TTL) and forbid ML/AI use — irrelevant for private use, a real problem if this is ever published. |
-| Gemini (`gemini-3.8-flash`) | configured in Shortlist as "curator", currently **idle** | Pavel already has a Google AI key; ask before using it here. Useful for embeddings/re-ranking if the design wants them. |
+| Gemini / OpenRouter | `GEMINI_API_KEY`, `OPENROUTER_API_KEY` in the gitignored `.envrc` | Item embeddings (`gemini-embedding-2` via OpenRouter, adopted for shows) and the LLM reranker (measured, not adopted). Gemini's free tier is too slow for the catalogue; see `docs/results.md`. |
 | Kometa 2.4.8 | `media` stack, config on the NAS (not in git) | Owns Movies genre normalisation (TMDb genres + merge map) and four decade rows. Not relevant to ranking; relevant if we ever write Plex collections (label conventions, `label!=Shortlist_*` share filters). |
 
 Workstation: Arch, **zsh** (no word-splitting of unquoted vars — write non-trivial shell via
@@ -181,16 +181,19 @@ GET /healthz
 GET /api/suggestions/<plex_id>?limit=200&family=exclude|include|only
 ```
 
-Shipped ranker (`harness/blend.py` + `harness/signals.IntentSeeds`): graph PPR (1) +
-content per-seed kNN (2) + MovieLens EASE (1), per-media percentiles renormalised over the
-components that scored the item; own Seerr requests as seeds; continuation bonus 0.1 (rating
+Shipped ranker (`harness/tune.final_blend` = `harness/blend.py` + `harness/signals.IntentSeeds`):
+graph PPR + TF-IDF content per-seed kNN + MovieLens EASE + gemini-embedding-2 content kNN,
+per-media weights (movies 1/2/1/0, shows 1/1/1/3), per-media percentiles renormalised over
+the components that scored the item; own Seerr requests as seeds; continuation bonus 0.1 (rating
 ≥ 6, one per window of ten); media-mix interleave to the user's recent movie share. Items
 carry `kids` so picks can offer a family lane; the API trusts `plex_id` because it listens
 only on an internal network — identity is picks' job. Users with < 3 seeds get a
 recent-popularity list. A full build for 15 users is ~25 s and needs no TMDb calls beyond
 new releases. Data on disk: `harness.db` (~60 MB), `tmdb_cache.db` (~470 MB, 180-day TTL),
-`movielens/ease_lam500.npz` (~300 MB). `Containerfile` builds the x86_64 image; the data
-directory is a mounted volume at `RECOMMENDARR_DATA`.
+`movielens/ease_lam500.npz` (~300 MB), `embeddings_gemini-embedding-2_768.npz` (~92 MB),
+`llm_cache.db`. Optional env `OPENROUTER_API_KEY` lets the nightly build embed new titles
+(≈ $0.003 per 100 titles); without it new titles simply lack that component. `Containerfile`
+builds the x86_64 image; the data directory is a mounted volume at `RECOMMENDARR_DATA`.
 
 Working style for the engine itself: same as picks (Python, small, SQLite, no daemon that
 cannot run on TrueNAS). Numpy/scipy are fine; a trained model must ship as a small artefact.

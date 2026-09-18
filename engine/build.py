@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import numpy as np
 
-from harness import blend, catalogue, content, data, engagement, graph, movielens, pull, resolve, signals, tmdb
+from harness import blend, catalogue, content, data, engagement, graph, llm, movielens, pull, resolve, signals, tmdb, tune
 from harness.data import Key, Seed, UserContext
 
 MIN_SEEDS = 3                 # below this a user gets the household/popularity fallback
@@ -108,11 +108,8 @@ def build(con) -> None:
 
     items = data.load_items(con)
     contexts = contexts_now(con, items)
-    scorer = signals.IntentSeeds(
-        blend.Blend([graph.GraphPPR(), content.ContentSeedKNN(), movielens.MovieLensEASE()],
-                    [1.0, 2.0, 1.0], continuations=True, media_mix=True, name="engine"),
-        signals.requests_by_user(con),
-    )
+    space = llm.EmbeddingSpace(con, items)
+    scorer = signals.IntentSeeds(tune.final_blend(space if len(space.keys) else None), signals.requests_by_user(con))
     scorer.prepare(contexts, items)
     space = scorer.scorer.components[1].space
     built_at = int(time.time())

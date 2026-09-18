@@ -83,3 +83,23 @@ TMDb `/recommendations` + `/similar`, filter, rank by rating × affinity × age 
    accounts, or an **offline evaluation**.
 3. Curatarr's profile scorer and Immaculaterr's candidate-pool/lane mixing are the two
    pieces of prior art worth reading before writing ours.
+
+## External interaction datasets — search of 2026-09-17 (for TV, and for movies newer than MovieLens)
+
+Question: is there a MovieLens-like per-user dataset for TV, or one with more recent movies?
+Searched arXiv, GroupLens, Kaggle, Hugging Face and the tracker platforms. Answer: **no
+drop-in for TV; MovieLens 32M remains the freshest open movie set.**
+
+| Dataset | What | Usable here? |
+|---|---|---|
+| MovieLens 32M (GroupLens, collected 10/2023, released 05/2024) | 32M ratings, 87k movies, `links.csv` → TMDb | **Yes — in use.** Nothing newer exists; `ml-latest` is only a small rolling sample. The Waterloo ML-32M extension adds evaluation objectives, not newer data. |
+| MTS KION (arXiv 2209.00325) | 5.5M implicit interactions, 962k users, 15.7k films **and series**, watch %, 2021, Russian VOD | Only open per-user set with TV, but item ids are KION's own (title+year matching to TMDb; Russian catalogue skew); 2021 data. Medium-low value; not pursued. |
+| ContentWise Impressions (2020) | Implicit + impressions, movies and series, OTT | Items fully anonymised — cannot join to TMDb. Unusable. |
+| Netflix Prize (2005) | 100M ratings incl. some TV seasons | 2005; unusable for freshness. |
+| Letterboxd scrapes (Kaggle `samlearner`, GitHub `sdl60660`) | Scraped public diaries/ratings | Scraped, licence unclear, movies only; Letterboxd itself (30M members, 672M ratings in 2025) publishes no research set. |
+| Trakt, TV Time, Simkl, Serializd | Per-user TV tracking at scale | No public per-user dumps; Trakt exposes only item-level `related` and aggregate stats. |
+| MyAnimeList dumps | Per-user anime lists | Only if anime matters. |
+| 2025–26 releases (VK-LSVD, KuaiLive, Yambda) | Short video / live streaming / music | Wrong domain. |
+
+Consequence: the TV collaborative signal stays graph + content (what shipped); the one
+untested TV edge source is Trakt `related` (needs a client id).
