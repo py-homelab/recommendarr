@@ -154,11 +154,8 @@ Pavel created a Trakt app (`TRAKT_CLIENT_ID` in `.envrc`). Every `api.trakt.tv` 
 the bare root returns `403 Forbidden` from Cloudflare (no `x-runtime`/`x-request-id`, so the
 request never reaches Trakt's app); the root returns 412 with Rails headers. Same with a
 browser user agent, with and without the key, for public endpoints (`/movies/trending`).
-This is trakt/trakt-api issue #939: a path-scoped Cloudflare rule blocking all API clients
-from every network since 2026-09-08, no official response yet. Not a problem on our side.
-
-Not run. Re-probe with `curl -H 'trakt-api-version: 2' -H "trakt-api-key: $TRAKT_CLIENT_ID"
-https://api.trakt.tv/movies/trending?limit=1` before spending any more time; when it returns
-200, the experiment is: one `GET /{movies|shows}/{imdb_id}/related` per catalogue title
-(IMDb ids are in the TMDb cache), cached, ~2.5 h at 1,000 requests / 5 min, then a second
-edge set for the graph scorer, tuned on folds 0–7, tested on 8–10.
+Also 403 with a dozen User-Agent variants, browser header sets, HTTP/1.1, and
+browser-impersonating TLS fingerprints (curl_cffi chrome/safari/firefox) — so neither the
+header nor the client fingerprint is the discriminator. Pavel's reading of the GitHub
+threads: **Trakt now requires VIP for API access.** Decision (Pavel, 2026-09-17): **drop
+Trakt for good**; do not retry. `TRAKT_CLIENT_ID` in `.envrc` is unused and can be removed.
