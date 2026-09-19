@@ -8,9 +8,9 @@ def main() -> None:
     parser.add_argument("command", choices=["build", "serve"])
     args = parser.parse_args()
     if args.command == "build":
-        from . import build
+        from . import build, service
 
-        build.build(db.connect())
+        build.build(db.connect(), service.VERSION)
     else:
         from . import service
 

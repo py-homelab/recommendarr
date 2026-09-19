@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS builds (built_at INTEGER PRIMARY KEY, users INTEGER, 
 """
 
 SURFACES = {"missing": "suggestions", "library": "library_suggestions"}
+META_SCHEMA = "CREATE TABLE IF NOT EXISTS engine_meta (key TEXT PRIMARY KEY, value TEXT);"
 # The library surface is ranked in full: Shortlist's rows narrow it (a season, one person's libraries,
 # unstarted shows, draw-without-replacement across rows), and a cap there left a seasonal row with
 # whatever of its season happened to make the head. ~1,900 titles per person.
@@ -232,7 +233,7 @@ def explain(space: content.ItemSpace, ctx: UserContext, key: Key, items, continu
     ]
 
 
-def build(con) -> None:
+def build(con, version: str = "") -> None:
     started = time.time()
     calls0 = tmdb.network_calls
     con.executescript(SCHEMA)
@@ -269,6 +270,8 @@ def build(con) -> None:
         users = len(contexts)
     seconds = time.time() - started
     con.execute("INSERT INTO builds VALUES (?,?,?,?)", (built_at, users, seconds, tmdb.network_calls - calls0))
+    con.executescript(META_SCHEMA)
+    con.execute("INSERT OR REPLACE INTO engine_meta VALUES ('built_by', ?)", (version,))
     con.commit()
     print(f"built {users} users x {len(SURFACES)} surfaces in {seconds:.0f}s, {tmdb.network_calls - calls0} TMDb calls, "
           f"{datetime.fromtimestamp(built_at, timezone.utc):%Y-%m-%d %H:%M}Z")

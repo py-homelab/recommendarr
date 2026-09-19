@@ -240,7 +240,7 @@ def _age_builds(db_dir):
 
 def test_a_failed_build_is_recorded_and_reported(nightly_db, monkeypatch, capsys):
     _age_builds(nightly_db)
-    def boom(con):
+    def boom(con, version=""):
         raise RuntimeError("disk I/O error")
 
     monkeypatch.setattr(service.build, "build", boom)
@@ -326,6 +326,11 @@ def test_a_build_without_neighbours_is_rebuilt_on_start(nightly_db, monkeypatch)
         pass
     assert calls == ["last build predates focused rows and full library lists"]
     _neighbours(nightly_db, [(900, "movie", 30, "show", 0.9)])
+    con = sqlite3.connect(nightly_db / "harness.db")
+    con.executescript(build.META_SCHEMA)
+    con.execute("INSERT INTO engine_meta VALUES ('built_by', ?)", (service.VERSION,))
+    con.commit()
+    con.close()
     calls.clear()
     try:
         service.nightly()
@@ -384,3 +389,34 @@ def test_the_library_surface_ranks_every_candidate():
     meta = {k: {"poster_path": "", "overview": ""} for k in items}
     rows = build.rank_user(Scorer(), type("Space", (), {"index": {}})(), ctx, items, meta, 1, 1000, limit=None)
     assert [r[2] for r in rows] == [1, 2, 5, 4, 3]  # scored first, then the rest by votes
+
+
+def test_a_rating_decides_before_the_genres():
+    from harness import signals
+
+    def it(cert, genres):
+        return _item(1, "show", genres, [])[1].__class__(**{**_item(1, "show", genres, [])[1].__dict__, "certification": cert})
+
+    assert signals.is_kids(it("TV-14", [16, 35, 10751])) is False    # King of the Hill: TMDB says "Family"
+    assert signals.is_kids(it("TV-Y7", [10759, 16, 10765])) is True  # Star Wars Rebels: no family genre
+    assert signals.is_kids(it("TV-G", [99])) is False                # Planet Earth II: all ages, not children's
+    assert signals.is_kids(it("G", [16, 10751, 35])) is True         # Toy Story 3
+    assert signals.is_kids(it(None, [10762])) is True                # unrated, a Kids genre
+
+
+def test_a_new_version_rebuilds_on_start(nightly_db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, "run_build", lambda reason: calls.append(reason))
+    monkeypatch.setattr(service, "last_build", lambda: 10**10)
+    monkeypatch.setattr(service.time, "sleep", lambda s: (_ for _ in ()).throw(SystemExit))
+    _neighbours(nightly_db, [(900, "movie", 30, "show", 0.9)])
+    con = sqlite3.connect(nightly_db / "harness.db")
+    con.executescript(build.META_SCHEMA)
+    con.execute("INSERT INTO engine_meta VALUES ('built_by', '0.4.0')")
+    con.commit()
+    con.close()
+    try:
+        service.nightly()
+    except SystemExit:
+        pass
+    assert calls == [f"last build was made by 0.4.0, not {service.VERSION}"]

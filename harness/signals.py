@@ -10,13 +10,21 @@ import dataclasses
 
 from .data import Item, Key, Seed, UserContext
 
-KIDS_CERTS = {"G", "TV-Y", "TV-Y7", "TV-Y7-FV", "TV-G"}
+# A children's title, by its US rating first: TV-Y / TV-Y7 are made for children whatever the genres;
+# a teen or adult rating vetoes the genre rule (TMDB tags King of the Hill, TV-14, "Animation, Family").
+# G and TV-G mean "all ages", not "for children" (2001, Planet Earth II, MasterChef): they count only
+# with a children's genre, like an unrated title. Measured 2026-09-19 on the library: 186 -> 159
+# titles flagged, none newly, household labels unchanged.
+CHILDREN_CERTS = {"TV-Y", "TV-Y7", "TV-Y7-FV"}
+TEEN_ADULT_CERTS = {"PG-13", "R", "NC-17", "TV-14", "TV-MA"}
 GENRE_ANIMATION, GENRE_FAMILY, GENRE_KIDS = 16, 10751, 10762
 
 
 def is_kids(it: Item) -> bool:
-    if it.certification in KIDS_CERTS:
+    if it.certification in CHILDREN_CERTS:
         return True
+    if it.certification in TEEN_ADULT_CERTS:
+        return False
     genres = set(it.genres)
     return GENRE_KIDS in genres or {GENRE_ANIMATION, GENRE_FAMILY} <= genres
 

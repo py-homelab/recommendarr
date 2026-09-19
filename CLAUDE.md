@@ -205,6 +205,9 @@ stays at 300), `season` narrows the candidates before the per-media cut, and `se
 closeness to the request's seeds via the nightly `item_neighbours` table (top 100 library neighbours
 per library title: TF-IDF content, averaged with gemini embeddings where both titles have one).
 `/v1/info` lists `features: ["season", "seed_focus"]`. A start on a build without neighbours rebuilds.
+Children's titles (v0.4.1, `signals.is_kids`): rating first — TV-Y/TV-Y7 always, PG-13/R/NC-17/TV-14/TV-MA
+never (TMDB tags King of the Hill "Animation, Family"), G/TV-G and unrated only with a children's genre.
+A start on a build made by another engine version rebuilds (`engine_meta.built_by`).
 The fork draws rows without replacement from one engine answer, re-weights a row's own `recency`, and
 builds rows that name their own sources with Shortlist's built-in engine.
 

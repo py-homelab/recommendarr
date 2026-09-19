@@ -34,7 +34,7 @@ from harness.llm import GENRES
 from . import build
 
 NAME = "recommendarr"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 # What this engine does with the request beyond ranking, so Shortlist can say when a row setting has
 # no effect: `season` narrows the candidates to the season's titles before the cut, `seed_focus` ranks
 # by closeness to the request's seeds instead of the person's whole taste.
@@ -121,7 +121,7 @@ def run_build(reason: str) -> None:
         print(f"build starting ({reason})")
         _record_attempt(started, reason=reason)
         try:
-            build.build(db.connect())
+            build.build(db.connect(), VERSION)
         except Exception as exc:  # keep serving the previous lists — and say so everywhere
             traceback.print_exc()
             print(f"build failed ({reason}): {exc!r}")
@@ -391,6 +391,18 @@ def households_built() -> bool:
         con.close()
 
 
+def built_by() -> str | None:
+    """The engine version that made the newest build — a new version rebuilds on start, so a change to
+    what a build writes (a children's-title rule, say) reaches the lists before the next nightly."""
+    con = db.connect()
+    try:
+        con.executescript(build.META_SCHEMA)
+        row = con.execute("SELECT value FROM engine_meta WHERE key = 'built_by'").fetchone()
+        return row[0] if row else None
+    finally:
+        con.close()
+
+
 def neighbours_built() -> bool:
     """Whether the last build wrote the neighbour table and full library lists (v0.4.0)."""
     con = db.connect()
@@ -412,6 +424,8 @@ def nightly() -> None:
         run_build("last build has no household labels")
     elif not neighbours_built():
         run_build("last build predates focused rows and full library lists")
+    elif built_by() != VERSION:
+        run_build(f"last build was made by {built_by() or 'an older version'}, not {VERSION}")
     while True:
         now = datetime.now()
         target = now.replace(hour=BUILD_HOUR, minute=0, second=0, microsecond=0)
