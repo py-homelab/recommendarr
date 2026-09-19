@@ -222,3 +222,21 @@ what `family=exclude` on the grown-ups' rows removes, and what the Family row is
 Known display quirk: `explain()` names the TF-IDF-nearest seed, which is sometimes an odd
 neighbour (Mean Girls ← Chip 'n Dale); ranking is unaffected. Worth a better attribution
 (per-component contribution) when the row surface is live.
+
+## 2026-09-19 — incident: every build since 2026-09-17 22:22 failed, silently
+
+Found by the homelab-stacks session. The container runs `read_only: true`, so `/tmp` is read-only,
+and no SQLite temp directory was set: the nightly build read everything, then died on its first
+large sort with `OperationalError('disk I/O error')`. The service kept answering from the one good
+build (2026-09-17) and `/healthz` said `ready: true` throughout, so nothing noticed for two days. The
+lists people saw, and the v0.3.0 household labels, were never refreshed.
+
+My release check at v0.1.0 missed it: `podman run --read-only` mounts a writable `/tmp` by default,
+unlike Compose's `read_only`. Reproduction needs `--read-only-tmpfs=false`.
+
+Fixed in v0.3.1: `SQLITE_TMPDIR` defaults to `$RECOMMENDARR_DATA/tmp` (set in the package
+`__init__`, because Python's `sqlite3` fixes SQLite's temp directory when it is imported); `serve`
+proves SQLite can spill at start and refuses to start otherwise; every build attempt is recorded
+(`build_attempts`); `/healthz` returns 503 once the newest good build is older than 50 h (or the only
+attempt failed) and reports `last_build_error`; `/v1/recommend` refuses stale lists with 503 so
+Shortlist falls back to its own engine and says so; failed builds log a traceback.

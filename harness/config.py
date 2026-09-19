@@ -8,6 +8,28 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = Path(os.environ.get("RECOMMENDARR_DATA", ROOT / "data"))
+
+# SQLite spills big sorts and temp tables to a temp directory, which it picks ONCE, when Python's
+# `sqlite3` module is IMPORTED, from SQLITE_TMPDIR then TMPDIR then /var/tmp, /usr/tmp, /tmp. So this
+# must run before anything imports sqlite3 — `harness/__init__` and `engine/__init__` import it first. In a read-only container
+# none of those is writable and every large build dies with "disk I/O error" while the service keeps
+# serving its previous lists — so point it under the data directory unless the operator already chose
+# a writable one. Set here, at import, because it must happen before any connection is opened.
+TMP_DIR = DATA_DIR / "tmp"
+
+
+def _writable(path: str | None) -> bool:
+    return bool(path) and os.path.isdir(path) and os.access(path, os.W_OK)
+
+
+if not _writable(os.environ.get("SQLITE_TMPDIR")):
+    try:
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        os.environ["SQLITE_TMPDIR"] = str(TMP_DIR)
+        if not _writable(os.environ.get("TMPDIR")):
+            os.environ["TMPDIR"] = str(TMP_DIR)
+    except OSError:
+        pass  # `check_temp_dir` at service start says so, loudly
 REPORTS_DIR = ROOT / "reports"
 DB_PATH = DATA_DIR / "harness.db"
 

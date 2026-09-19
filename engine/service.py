@@ -22,6 +22,7 @@ import os
 import signal
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -32,15 +33,56 @@ from harness.llm import GENRES
 from . import build
 
 NAME = "recommendarr"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 PORT = int(os.environ.get("ENGINE_PORT", "8090"))
 BUILD_HOUR = int(os.environ.get("ENGINE_BUILD_HOUR", "4"))
 TOKEN = os.environ.get("ENGINE_TOKEN", "")
 STALE_AFTER = 24 * 3600        # a start with no build, or one older than this, builds first
+# Lists older than this are no longer served to Shortlist's rows (it falls back to its own engine) and
+# /healthz reports unhealthy: two missed nightlies plus slack. Serving them is fine for a day; claiming
+# they are current for two is what hid a failing build for two days.
+STALE_ALERT = int(os.environ.get("ENGINE_STALE_ALERT_HOURS", "50")) * 3600
 DEFAULT_LIMIT = 200
 MAX_BODY = 4 * 1024 * 1024     # a person's history plus a library's ids is well under a megabyte
 _build_lock = threading.Lock()
 GENRE_IDS = {name.lower(): gid for gid, name in GENRES.items()}
+
+
+ATTEMPTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS build_attempts (
+    started_at INTEGER PRIMARY KEY,
+    finished_at INTEGER,
+    ok INTEGER,                           -- NULL while running
+    reason TEXT,
+    error TEXT
+);
+"""
+
+
+def build_status() -> dict:
+    """What /healthz and /v1/info report: the newest successful build, the newest attempt and how it
+    ended, and whether the lists are stale enough that serving them as current would be a lie."""
+    con = db.connect()
+    try:
+        con.executescript(ATTEMPTS_SCHEMA)
+        con.execute("CREATE TABLE IF NOT EXISTS builds (built_at INTEGER PRIMARY KEY, users INTEGER, seconds REAL, network_calls INTEGER)")
+        built = con.execute("SELECT MAX(built_at) FROM builds").fetchone()[0]
+        last = con.execute("SELECT * FROM build_attempts ORDER BY started_at DESC LIMIT 1").fetchone()
+    finally:
+        con.close()
+    now = time.time()
+    running = last is not None and last["ok"] is None
+    stale = (built is None and last is not None and last["ok"] == 0) or (built is not None and now - built > STALE_ALERT)
+    return {
+        "ready": built is not None and not stale,
+        "built_at": built,
+        "age_hours": round((now - built) / 3600, 1) if built else None,
+        "stale": stale,
+        "building": running,
+        "last_build_at": last["started_at"] if last else None,
+        "last_build_ok": None if last is None or last["ok"] is None else bool(last["ok"]),
+        "last_build_error": last["error"] if last and last["ok"] == 0 else None,
+    }
 
 
 def last_build() -> int | None:
@@ -52,13 +94,35 @@ def last_build() -> int | None:
         con.close()
 
 
+def _record_attempt(started: int, **fields) -> None:
+    con = db.connect()
+    try:
+        con.executescript(ATTEMPTS_SCHEMA)
+        if "ok" not in fields:
+            con.execute("INSERT OR REPLACE INTO build_attempts (started_at, reason) VALUES (?, ?)", (started, fields["reason"]))
+        else:
+            con.execute(
+                "UPDATE build_attempts SET finished_at = ?, ok = ?, error = ? WHERE started_at = ?",
+                (int(time.time()), int(fields["ok"]), fields.get("error"), started),
+            )
+        con.commit()
+    finally:
+        con.close()
+
+
 def run_build(reason: str) -> None:
     with _build_lock:
+        started = int(time.time())
         print(f"build starting ({reason})")
+        _record_attempt(started, reason=reason)
         try:
             build.build(db.connect())
-        except Exception as exc:  # keep serving the previous lists
+        except Exception as exc:  # keep serving the previous lists — and say so everywhere
+            traceback.print_exc()
             print(f"build failed ({reason}): {exc!r}")
+            _record_attempt(started, ok=False, error=f"{type(exc).__name__}: {exc}"[:500])
+        else:
+            _record_attempt(started, ok=True)
 
 
 def fetch(plex_id: int, limit: int, family: str) -> dict:
@@ -211,6 +275,12 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0 or length > MAX_BODY:
             return self._json(400, {"error": "body required"})
+        status = build_status()
+        if status["stale"]:
+            # Stale lists would rank everyone's rows from days-old viewing without anyone noticing; a
+            # refusal makes Shortlist fall back to its own engine and say so in the run trace.
+            return self._json(503, {"error": f"lists are stale (last good build {status['age_hours']} h ago; "
+                                             f"last error: {status['last_build_error']})"})
         try:
             req = json.loads(self.rfile.read(length))
             if not isinstance(req, dict) or "plex_account_id" not in req:
@@ -223,15 +293,16 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         parts = url.path.strip("/").split("/")
         if url.path == "/healthz":
-            built = last_build()
-            return self._json(200, {"ok": True, "ready": built is not None, "built_at": built})
+            # 503 once the lists are stale (or the only build ever attempted failed): the process is up,
+            # but a green healthcheck would say the lists are current when they are not.
+            status = build_status()
+            return self._json(503 if status["stale"] else 200, {"ok": not status["stale"], **status})
         if url.path == "/v1/info":
             if not self._authorised():
                 return self._json(401, {"error": "bad token"})
-            built = last_build()
             return self._json(200, {
                 "name": NAME, "version": VERSION, "surfaces": sorted(build.SURFACES), "serves_cold": True,
-                "ready": built is not None, "built_at": built,
+                **build_status(),
             })
         if len(parts) == 3 and parts[:2] == ["api", "suggestions"] and parts[2].isdigit():
             q = parse_qs(url.query)
@@ -273,6 +344,11 @@ def nightly() -> None:
 
 
 def serve() -> None:
+    problem = db.check_temp_dir()
+    if problem:
+        # Fail loudly at start: every build would die on its first big sort while the service kept
+        # answering from its previous lists.
+        raise SystemExit(f"engine cannot build: {problem}. Point SQLITE_TMPDIR at a writable directory.")
     threading.Thread(target=nightly, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     # As PID 1 in a container Python ignores SIGTERM unless handled; stop serving cleanly.

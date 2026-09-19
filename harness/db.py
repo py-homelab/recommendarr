@@ -1,3 +1,4 @@
+import os
 import sqlite3
 
 from . import config
@@ -68,3 +69,25 @@ def connect() -> sqlite3.Connection:
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
     return con
+
+
+def check_temp_dir() -> str | None:
+    """Prove SQLite can spill to disk, by making it: a temp table larger than its one-page cache.
+    Returns None when it can, else the reason. A build that cannot spill fails on its first big sort."""
+    import sqlite3 as _sqlite3
+
+    try:
+        config.DATA_DIR.mkdir(exist_ok=True)
+        con = _sqlite3.connect(config.DATA_DIR / "temp_probe.db")
+        try:
+            con.execute("PRAGMA temp_store = FILE")
+            con.execute("PRAGMA temp.cache_size = 1")
+            con.execute("CREATE TEMP TABLE probe (x TEXT)")
+            con.executemany("INSERT INTO probe VALUES (?)", (("x" * 200,) for _ in range(2000)))
+            con.execute("SELECT x FROM probe ORDER BY x DESC").fetchall()
+        finally:
+            con.close()
+            (config.DATA_DIR / "temp_probe.db").unlink(missing_ok=True)
+    except _sqlite3.Error as exc:
+        return f"SQLite cannot write temp files ({exc}); SQLITE_TMPDIR={os.environ.get('SQLITE_TMPDIR')!r}"
+    return None

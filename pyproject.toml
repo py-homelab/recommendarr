@@ -1,6 +1,6 @@
 [project]
 name = "recommendarr"
-version = "0.3.0"
+version = "0.3.1"
 description = "Per-user recommendation engine for a Plex library, with an offline evaluation harness"
 requires-python = ">=3.12"
 dependencies = [

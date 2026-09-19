@@ -52,6 +52,7 @@ def nightly_db(tmp_path, monkeypatch):
             (100, rank, tmdb_id, media, title, kids, w, 300 - rank),
         )
     con.execute("INSERT INTO builds VALUES (1000, 1, 1.0, 0)")
+    con.execute("INSERT INTO builds VALUES (?, 1, 1.0, 0)", (int(__import__("time").time()),))  # fresh
     con.executescript(build.HOUSEHOLD_SCHEMA)
     con.execute("INSERT INTO households VALUES (100, 'family', 0.35, 66, 187, 1000)")
     con.execute(
@@ -83,7 +84,7 @@ def test_library_surface_keeps_the_nightly_order_and_shortlists_filters(nightly_
     assert out["items"][1]["reason"] == "Next after Fargo"
     assert out["items"][2]["seed"] is None and out["items"][2]["reason"] is None
     assert out["trace"]["history_sent"] == 1 and out["trace"]["history_known"] == 1
-    assert out["trace"]["built_at"] == 1000
+    assert out["trace"]["built_at"] > 1000
 
 
 def test_the_requests_library_exclusions_genres_media_and_limit_are_honoured(nightly_db):
@@ -211,3 +212,58 @@ def test_a_build_without_household_labels_is_rebuilt_on_start(nightly_db, monkey
     except SystemExit:
         pass
     assert calls == ["last build has no household labels"]
+
+
+def test_an_unwritable_temp_dir_is_replaced_by_one_under_the_data_dir(tmp_path):
+    """A read-only container: SQLITE_TMPDIR/TMPDIR unwritable. The engine must still spill big sorts."""
+    import subprocess
+    import sys
+
+    code = (
+        "import os; from harness import config, db; "
+        "print(os.environ['SQLITE_TMPDIR']); print(db.check_temp_dir())"
+    )
+    env = {**__import__("os").environ, "RECOMMENDARR_DATA": str(tmp_path), "SQLITE_TMPDIR": "/proc", "TMPDIR": "/proc"}
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout.split("\n")
+    assert out[0] == str(tmp_path / "tmp")
+    assert out[1] == "None"
+
+
+def _age_builds(db_dir):
+    import sqlite3 as _sq
+
+    con = _sq.connect(db_dir / "harness.db")
+    con.execute("DELETE FROM builds WHERE built_at > 1000")
+    con.commit()
+    con.close()
+
+
+def test_a_failed_build_is_recorded_and_reported(nightly_db, monkeypatch, capsys):
+    _age_builds(nightly_db)
+    def boom(con):
+        raise RuntimeError("disk I/O error")
+
+    monkeypatch.setattr(service.build, "build", boom)
+    service.run_build("test")
+    status = service.build_status()
+    assert status["last_build_ok"] is False and status["last_build_error"] == "RuntimeError: disk I/O error"
+    assert "Traceback" in capsys.readouterr().err
+    # The previous build (built_at 1000, decades ago) is stale: not ready, 503 everywhere it matters.
+    assert status["stale"] is True and status["ready"] is False
+
+
+def test_stale_lists_fail_healthz_and_refuse_recommend_but_picks_still_served(server, nightly_db):
+    _age_builds(nightly_db)
+    status, body = _call(server, "/healthz")
+    assert status == 503 and body["stale"] is True and body["built_at"] == 1000
+    status, body = _call(server, "/v1/recommend", {"plex_account_id": 100}, token="s3cret")
+    assert status == 503 and "stale" in body["error"]
+    assert _call(server, "/api/suggestions/100")[0] == 200  # picks keeps its last list
+
+
+def test_fresh_lists_are_healthy(server):
+    status, body = _call(server, "/healthz")
+    assert status == 200 and body["ready"] is True and body["stale"] is False
+    assert _call(server, "/v1/recommend", {"plex_account_id": 100}, token="s3cret")[0] == 200
+    status, info = _call(server, "/v1/info", token="s3cret")
+    assert info["ready"] is True and "last_build_error" in info
