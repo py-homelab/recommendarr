@@ -200,6 +200,14 @@ the order is final, `kids` and a `reason` ride on every item. `ENGINE_TOKEN` (op
 `/v1/*` with a bearer token. Shortlist's own history is not used for ranking (Tautulli has the
 device signal); the trace reports `history_sent` vs `history_known` so a stale side shows.
 
+Household label (v0.3.0): the nightly build writes `households(plex_id, label, kids_share,
+kids_titles, window_titles)` from each person's last 12 months of positives (children's titles by
+`signals.is_kids`) and every `/v1/recommend` answer carries it as `household`. Labels: `adult`,
+`family` (≥15% children's titles from ≥4 titles, ≤80%), `kids` (>80%); <10 titles → adult. Env
+overrides: `ENGINE_HOUSEHOLD_WINDOW_DAYS`, `ENGINE_HOUSEHOLD_MIN_TITLES`, `ENGINE_FAMILY_MIN_SHARE`,
+`ENGINE_FAMILY_MIN_KIDS_TITLES`, `ENGINE_KIDS_ACCOUNT_MIN_SHARE`. Shortlist re-derives the label
+from the counts with its own settings, and a per-person override wins over both.
+
 Shipped ranker (`harness/tune.final_blend` = `harness/blend.py` + `harness/signals.IntentSeeds`):
 graph PPR + TF-IDF content per-seed kNN + MovieLens EASE + gemini-embedding-2 content kNN,
 per-media weights (movies 1/2/1/0, shows 1/1/1/3), per-media percentiles renormalised over

@@ -52,6 +52,8 @@ def nightly_db(tmp_path, monkeypatch):
             (100, rank, tmdb_id, media, title, kids, w, 300 - rank),
         )
     con.execute("INSERT INTO builds VALUES (1000, 1, 1.0, 0)")
+    con.executescript(build.HOUSEHOLD_SCHEMA)
+    con.execute("INSERT INTO households VALUES (100, 'family', 0.35, 66, 187, 1000)")
     con.execute(
         "INSERT INTO engagements VALUES (100, 900, 'movie', 1, 1, 1, 0, 100, 1.0, 0.0, 'positive')"
     )
@@ -174,3 +176,21 @@ def test_the_cold_fallback_leads_with_recent_titles_then_fills_by_votes():
     items = dict([item(1, "2000-01-01", 50000), item(2, "2026-01-01", 10), item(3, "2026-02-01", 20), item(4, None, 99999)])
     ctx = UserContext(user_id=1, cutoff=0, seeds=[], negatives=set(), candidates=set(items), household_seeds={}, household_requests={})
     assert build.popularity_fallback(ctx, items) == [(3, "movie"), (2, "movie"), (4, "movie"), (1, "movie")]
+
+
+def test_the_household_label_rides_with_every_answer(nightly_db):
+    out = service.recommend({"plex_account_id": 100, "surface": "library"})
+    assert out["household"] == {"label": "family", "kids_share": 0.35, "kids_titles": 66, "window_titles": 187, "window_days": 365}
+    assert service.recommend({"plex_account_id": 7})["household"] is None
+
+
+def test_household_thresholds():
+    lab = build.household_label
+    assert lab(5, 5) == "adult"          # too few titles to judge
+    assert lab(10, 9) == "kids"          # 90%: a child's own account
+    assert lab(187, 66) == "family"      # 35%
+    assert lab(65, 32) == "family"       # 49%
+    assert lab(26, 4) == "family"        # 15.4%, 4 titles: over the line
+    assert lab(27, 4) == "adult"         # 14.8%: just under it (a real account on 2026-09-19)
+    assert lab(305, 23) == "adult"       # 8%: an adult who likes some animation
+    assert lab(20, 3) == "adult"         # 15% but only 3 titles

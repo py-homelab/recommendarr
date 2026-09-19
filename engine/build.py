@@ -5,6 +5,7 @@ Shortlist's rows draw from through the engine protocol). Everything here is read
 live services; the only writes are local."""
 
 import json
+import os
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -50,6 +51,64 @@ CREATE TABLE IF NOT EXISTS builds (built_at INTEGER PRIMARY KEY, users INTEGER, 
 """
 
 SURFACES = {"missing": "suggestions", "library": "library_suggestions"}
+
+# Household label per person, from their own last 12 months of positives (children's titles by
+# `signals.is_kids`). Measured 2026-09-19 on 12 accounts: two mixed family accounts at 35% and 49%,
+# one child's own account at 100%, a borderline 15%, everyone else at 0-8%.
+# The engine's own label is a suggestion: Shortlist re-derives it from the counts with thresholds from
+# its own settings (and a per-person override). These env vars set the engine's defaults.
+HOUSEHOLD_WINDOW_DAYS = int(os.environ.get("ENGINE_HOUSEHOLD_WINDOW_DAYS", "365"))
+HOUSEHOLD_MIN_TITLES = int(os.environ.get("ENGINE_HOUSEHOLD_MIN_TITLES", "10"))  # fewer: too little to judge -> adult
+FAMILY_MIN_SHARE = float(os.environ.get("ENGINE_FAMILY_MIN_SHARE", "0.15"))  # at least this share of kids titles ...
+FAMILY_MIN_KIDS_TITLES = int(os.environ.get("ENGINE_FAMILY_MIN_KIDS_TITLES", "4"))  # ... from this many -> family
+KIDS_ACCOUNT_MIN_SHARE = float(os.environ.get("ENGINE_KIDS_ACCOUNT_MIN_SHARE", "0.80"))  # above: a child's own account
+
+HOUSEHOLD_SCHEMA = """
+CREATE TABLE IF NOT EXISTS households (
+    plex_id INTEGER PRIMARY KEY,
+    label TEXT NOT NULL,                  -- adult | family | kids
+    kids_share REAL NOT NULL,
+    kids_titles INTEGER NOT NULL,
+    window_titles INTEGER NOT NULL,
+    built_at INTEGER NOT NULL
+);
+"""
+
+
+def household_label(window_titles: int, kids_titles: int) -> str:
+    """adult | family | kids — see the constants above."""
+    if window_titles < HOUSEHOLD_MIN_TITLES:
+        return "adult"
+    share = kids_titles / window_titles
+    if share > KIDS_ACCOUNT_MIN_SHARE:
+        return "kids"
+    if share >= FAMILY_MIN_SHARE and kids_titles >= FAMILY_MIN_KIDS_TITLES:
+        return "family"
+    return "adult"
+
+
+def write_households(con, items, built_at: int) -> dict[int, str]:
+    since = built_at - HOUSEHOLD_WINDOW_DAYS * 86400
+    counts: dict[int, list[int]] = {}
+    for r in con.execute(
+        "SELECT user_id, tmdb_id, media_type FROM engagements WHERE label = 'positive' AND last_at >= ?", (since,)
+    ):
+        it = items.get((r["tmdb_id"], r["media_type"]))
+        if it is None:
+            continue
+        c = counts.setdefault(r["user_id"], [0, 0])
+        c[0] += 1
+        c[1] += int(signals.is_kids(it))
+    con.execute("DELETE FROM households")
+    labels = {}
+    for (u,) in con.execute("SELECT user_id FROM users"):
+        total, kids = counts.get(u, [0, 0])
+        labels[u] = household_label(total, kids)
+        con.execute(
+            "INSERT INTO households VALUES (?,?,?,?,?,?)",
+            (u, labels[u], kids / total if total else 0.0, kids, total, built_at),
+        )
+    return labels
 
 
 def refresh_catalogue(con) -> None:
@@ -130,6 +189,7 @@ def build(con) -> None:
     started = time.time()
     calls0 = tmdb.network_calls
     con.executescript(SCHEMA)
+    con.executescript(HOUSEHOLD_SCHEMA)
     pull.run(con)
     resolve.run(con)
     engagement.run(con)
@@ -145,6 +205,8 @@ def build(con) -> None:
     space = scorer.scorer.components[1].space
     built_at = int(time.time())
     meta = {(r["tmdb_id"], r["media_type"]): r for r in con.execute("SELECT tmdb_id, media_type, poster_path, overview FROM items")}
+    labels = write_households(con, items, built_at)
+    print("households:", {k: sum(1 for v in labels.values() if v == k) for k in ("adult", "family", "kids")})
     users = 0
     for surface, table in SURFACES.items():
         if surface != "missing":

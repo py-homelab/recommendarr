@@ -32,7 +32,7 @@ from harness.llm import GENRES
 from . import build
 
 NAME = "recommendarr"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PORT = int(os.environ.get("ENGINE_PORT", "8090"))
 BUILD_HOUR = int(os.environ.get("ENGINE_BUILD_HOUR", "4"))
 TOKEN = os.environ.get("ENGINE_TOKEN", "")
@@ -127,6 +127,8 @@ def recommend(req: dict) -> dict:
                 )
             }
         built = con.execute("SELECT MAX(built_at) FROM builds").fetchone()[0]
+        con.executescript(build.HOUSEHOLD_SCHEMA)
+        hh = con.execute("SELECT * FROM households WHERE plex_id = ?", (plex_id,)).fetchone()
         known_history = con.execute(
             "SELECT COUNT(*) FROM engagements WHERE user_id = ? AND label = 'positive'", (plex_id,)
         ).fetchone()[0]
@@ -166,6 +168,14 @@ def recommend(req: dict) -> dict:
     return {
         "engine": {"name": NAME, "version": VERSION},
         "ordered": True,
+        # Who watches under this account, from its own last 12 months: "adult", "family" (a household
+        # sharing the account with children — keep children's titles to their own row) or "kids" (a
+        # child's own account). Null when the engine has not built a label for this person yet.
+        "household": (
+            {"label": hh["label"], "kids_share": round(hh["kids_share"], 3), "kids_titles": hh["kids_titles"],
+             "window_titles": hh["window_titles"], "window_days": build.HOUSEHOLD_WINDOW_DAYS}
+            if hh else None
+        ),
         "items": items,
         "trace": {
             "built_at": built, "surface": surface, "ranked": len(rows), "returned": len(items), "dropped": dropped,
