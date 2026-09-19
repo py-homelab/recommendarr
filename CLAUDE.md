@@ -217,3 +217,17 @@ builds the x86_64 image; the data directory is a mounted volume at `RECOMMENDARR
 Working style for the engine itself: same as picks (Python, small, SQLite, no daemon that
 cannot run on TrueNAS). Numpy/scipy are fine; a trained model must ship as a small artefact.
 Keep the homelab-stacks session in the loop only at the deployment boundary.
+
+## 8. The Shortlist fork (`~/Code/shortlist`, `github.com/py-homelab/shortlist`)
+
+Decided 2026-09-18: a thin fork of Shortlist with a pluggable engine rather than reimplementing its
+Plex delivery/privacy. Branches stack: `engine-plugin` (PR #1 fork-internal for CI: `Recommender`
+protocol, builtin moved verbatim, `HttpRecommender`, fallback, `RowSpec.family`, settings/UI/docs)
+→ `person-picks` (person role + trusted-proxy sign-in, `missing` surface → `user_suggestions`,
+`/api/me*`, the `/me` deck/grid page, PWA) → `retire-inbox` (inbox + Radarr/Sonarr routing deleted,
+`requests.overseerr.*` → `seerr.*`). Upstream PRs go to `stevezau/shortlist` `dev` from these, in
+order; the fork's `dev` publishes `ghcr.io/py-homelab/shortlist:dev`. Its rules: engine never
+imports server, tests required and no network, migrations guarded and frozen
+(`scripts/check_migration_freeze.py --write`), OpenAPI snapshot + `pnpm -C web gen:api` after any
+route change, `scripts/build_llms_full.py` after docs. Tooling there: `.venv/bin/python`,
+`web/node_modules/.bin/{tsc,eslint,vite,vitest}` (pnpm via `npx --yes pnpm@11.17.0`).
