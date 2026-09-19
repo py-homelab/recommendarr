@@ -203,3 +203,22 @@ built); "unstarted only" rows need started-but-unfinished shows excluded (engage
 `neutral`); franchise continuation works unchanged; "next season" is Plex's own Continue
 Watching, not ours. Delivering into Plex is Shortlist's privacy machinery, which the engine
 does not have.
+
+## 2026-09-18 — the engine protocol for Shortlist (v0.2.0)
+
+Decision (Pavel): a thin fork of Shortlist (`py-homelab/shortlist`) with a pluggable recommender
+— the built-in engine behind a protocol, ours over HTTP — rather than reimplementing Shortlist's
+Plex delivery/privacy. Stage 1 (Shortlist branch `engine-plugin`): `Recommender` protocol,
+builtin moved verbatim (5,066 tests still pass; golden behaviour preserved), `HttpRecommender`
+with order final, fallback, `serves_cold`, `RowSpec.family`, settings + UI + docs. Stage 2 (this
+repo): the nightly build now ranks a second surface, `library_suggestions` = library minus the
+person's positives, same blend (15 users × 2 surfaces in 29 s); `/v1/info` and `/v1/recommend`.
+
+Wire check (owner, library surface, real data, local engine): 300 ranked → 155 returned after
+Shortlist's exclusions/genres/limit, 26 ms, order preserved through `pre_rank` and
+`diversify_by_seed`. Owner's top-50 kids share: missing surface 22/50, library surface 8/50 —
+what `family=exclude` on the grown-ups' rows removes, and what the Family row is built from.
+
+Known display quirk: `explain()` names the TF-IDF-nearest seed, which is sometimes an odd
+neighbour (Mean Girls ← Chip 'n Dale); ranking is unaffected. Worth a better attribution
+(per-component contribution) when the row surface is live.

@@ -1,6 +1,8 @@
-"""Nightly build: refresh history, library, requests and catalogue, then rank the missing
-titles for every user with the adopted blend and write the `suggestions` table the API
-serves. Everything here is read-only against live services; the only writes are local."""
+"""Nightly build: refresh history, library, requests and catalogue, then rank two surfaces for
+every user with the adopted blend — the titles the library does not hold (`suggestions`, what
+picks shows) and the ones it does hold and they have not watched (`library_suggestions`, what
+Shortlist's rows draw from through the engine protocol). Everything here is read-only against
+live services; the only writes are local."""
 
 import json
 import time
@@ -31,8 +33,23 @@ CREATE TABLE IF NOT EXISTS suggestions (
     PRIMARY KEY (plex_id, tmdb_id, media_type)
 );
 CREATE INDEX IF NOT EXISTS suggestions_user ON suggestions (plex_id, rank);
+CREATE TABLE IF NOT EXISTS library_suggestions (
+    plex_id INTEGER NOT NULL,
+    rank INTEGER NOT NULL,
+    tmdb_id INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    title TEXT, year INTEGER, rating REAL, votes INTEGER, poster_path TEXT, overview TEXT,
+    kids INTEGER NOT NULL,
+    why TEXT,
+    score REAL,
+    built_at INTEGER NOT NULL,
+    PRIMARY KEY (plex_id, tmdb_id, media_type)
+);
+CREATE INDEX IF NOT EXISTS library_suggestions_user ON library_suggestions (plex_id, rank);
 CREATE TABLE IF NOT EXISTS builds (built_at INTEGER PRIMARY KEY, users INTEGER, seconds REAL, network_calls INTEGER);
 """
+
+SURFACES = {"missing": "suggestions", "library": "library_suggestions"}
 
 
 def refresh_catalogue(con) -> None:
@@ -60,26 +77,38 @@ def refresh_catalogue(con) -> None:
     print(f"catalogue: {len(todo)} new items")
 
 
-def contexts_now(con, items) -> dict[int, UserContext]:
+def contexts_now(con, items, surface="missing") -> dict[int, UserContext]:
+    """Every user's context over one surface: `missing` is the obtainable catalogue minus the
+    library and minus anything already requested; `library` is exactly the library (every title
+    Plex holds, catalogue or not). Both minus the person's own positives, in `_contexts`."""
     now = int(time.time())
-    today = date.today()
-    movie_limit = (today - timedelta(days=MOVIE_OBTAINABLE_LAG_DAYS)).isoformat()
-    show_limit = today.isoformat()
-    unavailable = {(r[0], r[1]) for r in con.execute("SELECT tmdb_id, media_type FROM library")}
-    unavailable |= {(r[0], r[1]) for r in con.execute("SELECT tmdb_id, media_type FROM seerr_requests")}
-    universe = {
-        k for k, it in items.items()
-        if it.in_catalogue and k not in unavailable and it.release_date
-        and it.release_date <= (movie_limit if k[1] == "movie" else show_limit)
-    }
+    library = {(r[0], r[1]) for r in con.execute("SELECT tmdb_id, media_type FROM library")}
+    if surface == "library":
+        universe = {k for k in items if k in library}
+    else:
+        today = date.today()
+        movie_limit = (today - timedelta(days=MOVIE_OBTAINABLE_LAG_DAYS)).isoformat()
+        show_limit = today.isoformat()
+        unavailable = library | {(r[0], r[1]) for r in con.execute("SELECT tmdb_id, media_type FROM seerr_requests")}
+        universe = {
+            k for k, it in items.items()
+            if it.in_catalogue and k not in unavailable and it.release_date
+            and it.release_date <= (movie_limit if k[1] == "movie" else show_limit)
+        }
     users = [r["user_id"] for r in con.execute("SELECT user_id FROM users")]
     return data._contexts(con, users, now, universe)
 
 
 def popularity_fallback(ctx: UserContext, items, years=3) -> list[Key]:
+    """Too few seeds to rank from: recent titles by votes first, then everything else by votes
+    (on the library surface the recent slice alone can be a handful)."""
     floor = str(date.today().year - years)
-    recent = [k for k in ctx.candidates if items[k].release_date and items[k].release_date >= floor]
-    return sorted(recent, key=lambda k: -items[k].vote_count)[:LIST_SIZE]
+
+    def key(k: Key) -> tuple:
+        it = items[k]
+        return (not (it.release_date and it.release_date >= floor), -it.vote_count)
+
+    return sorted(ctx.candidates, key=key)[:LIST_SIZE]
 
 
 def explain(space: content.ItemSpace, ctx: UserContext, key: Key, items, continuations) -> list[dict]:
@@ -107,32 +136,47 @@ def build(con) -> None:
     refresh_catalogue(con)
 
     items = data.load_items(con)
-    contexts = contexts_now(con, items)
     space = llm.EmbeddingSpace(con, items)
     scorer = signals.IntentSeeds(tune.final_blend(space if len(space.keys) else None), signals.requests_by_user(con))
+    # `prepare` builds the cross-user state (the household, the EASE fold-in) from the contexts'
+    # seeds, which are the same on both surfaces — only the candidate universe differs.
+    contexts = contexts_now(con, items, "missing")
     scorer.prepare(contexts, items)
     space = scorer.scorer.components[1].space
     built_at = int(time.time())
     meta = {(r["tmdb_id"], r["media_type"]): r for r in con.execute("SELECT tmdb_id, media_type, poster_path, overview FROM items")}
-    con.execute("DELETE FROM suggestions")
-    for u, ctx in contexts.items():
-        if len(ctx.seeds) >= MIN_SEEDS:
-            scores = scorer(ctx, items)
-            order = sorted(scores, key=lambda k: -scores[k])[:LIST_SIZE]
-            continuations = scorer.scorer.last_continuations
-        else:
-            order, continuations = popularity_fallback(ctx, items), {}
-        rows = []
-        for rank, k in enumerate(order):
-            it = items[k]
-            rows.append((
-                u, rank, k[0], k[1], it.title, it.year, it.vote_average, it.vote_count,
-                meta[k]["poster_path"], meta[k]["overview"], int(signals.is_kids(it)),
-                json.dumps(explain(space, ctx, k, items, continuations)), float(LIST_SIZE - rank), built_at,
-            ))
-        con.executemany("INSERT OR REPLACE INTO suggestions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    users = 0
+    for surface, table in SURFACES.items():
+        if surface != "missing":
+            contexts = contexts_now(con, items, surface)
+        con.execute(f"DELETE FROM {table}")
+        for u, ctx in contexts.items():
+            con.executemany(
+                f"INSERT OR REPLACE INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                rank_user(scorer, space, ctx, items, meta, u, built_at),
+            )
+        users = len(contexts)
     seconds = time.time() - started
-    con.execute("INSERT INTO builds VALUES (?,?,?,?)", (built_at, len(contexts), seconds, tmdb.network_calls - calls0))
+    con.execute("INSERT INTO builds VALUES (?,?,?,?)", (built_at, users, seconds, tmdb.network_calls - calls0))
     con.commit()
-    print(f"built {len(contexts)} users in {seconds:.0f}s, {tmdb.network_calls - calls0} TMDb calls, "
+    print(f"built {users} users x {len(SURFACES)} surfaces in {seconds:.0f}s, {tmdb.network_calls - calls0} TMDb calls, "
           f"{datetime.fromtimestamp(built_at, timezone.utc):%Y-%m-%d %H:%M}Z")
+
+
+def rank_user(scorer, space, ctx: UserContext, items, meta, plex_id: int, built_at: int) -> list[tuple]:
+    """One person's ranked list over the context's candidates, as rows for either surface table."""
+    if len(ctx.seeds) >= MIN_SEEDS:
+        scores = scorer(ctx, items)
+        order = sorted(scores, key=lambda k: -scores[k])[:LIST_SIZE]
+        continuations = scorer.scorer.last_continuations
+    else:
+        order, continuations = popularity_fallback(ctx, items), {}
+    rows = []
+    for rank, k in enumerate(order):
+        it = items[k]
+        rows.append((
+            plex_id, rank, k[0], k[1], it.title, it.year, it.vote_average, it.vote_count,
+            meta[k]["poster_path"], meta[k]["overview"], int(signals.is_kids(it)),
+            json.dumps(explain(space, ctx, k, items, continuations)), float(LIST_SIZE - rank), built_at,
+        ))
+    return rows

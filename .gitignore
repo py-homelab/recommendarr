@@ -8,3 +8,6 @@ docs/research/samples/
 .venv/
 __pycache__/
 *.pyc
+
+# Claude Code local permissions
+.claude/settings.local.json

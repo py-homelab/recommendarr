@@ -184,11 +184,21 @@ automerge) a pin-bump PR in homelab-stacks. Source: `github.com/py-homelab/recom
 `engine/` is the service picks will read. `docs/results.md` holds every number behind it.
 
 ```
-uv run python -m engine build   # nightly job: pull, resolve, engagement, catalogue refresh, rank all users
+uv run python -m engine build   # nightly job: pull, resolve, engagement, catalogue refresh, rank all users (both surfaces)
 uv run python -m engine serve   # HTTP on :8090 (+ nightly build thread at ENGINE_BUILD_HOUR)
-GET /healthz
-GET /api/suggestions/<plex_id>?limit=200&family=exclude|include|only
+GET  /healthz
+GET  /api/suggestions/<plex_id>?limit=200&family=exclude|include|only     # picks: the missing surface
+GET  /v1/info                                                             # Shortlist engine protocol (v0.2.0)
+POST /v1/recommend  {plex_account_id, surface: library|missing, media, limit_per_media, library, exclude, …}
 ```
+
+The `/v1` endpoints are the engine protocol the Shortlist fork (`py-homelab/shortlist`, branch
+`engine-plugin`, `docs/guides/engines.md` there) speaks: `surface=library` serves the
+`library_suggestions` table (library minus the person's positives, same blend), `surface=missing`
+the `suggestions` table; the request's `library`/`exclude`/`excluded_genres` are applied on top,
+the order is final, `kids` and a `reason` ride on every item. `ENGINE_TOKEN` (optional) gates
+`/v1/*` with a bearer token. Shortlist's own history is not used for ranking (Tautulli has the
+device signal); the trace reports `history_sent` vs `history_known` so a stale side shows.
 
 Shipped ranker (`harness/tune.final_blend` = `harness/blend.py` + `harness/signals.IntentSeeds`):
 graph PPR + TF-IDF content per-seed kNN + MovieLens EASE + gemini-embedding-2 content kNN,
