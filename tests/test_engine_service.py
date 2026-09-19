@@ -194,3 +194,20 @@ def test_household_thresholds():
     assert lab(27, 4) == "adult"         # 14.8%: just under it (a real account on 2026-09-19)
     assert lab(305, 23) == "adult"       # 8%: an adult who likes some animation
     assert lab(20, 3) == "adult"         # 15% but only 3 titles
+
+
+def test_a_build_without_household_labels_is_rebuilt_on_start(nightly_db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, "run_build", lambda reason: calls.append(reason))
+    monkeypatch.setattr(service, "last_build", lambda: 10**10)  # fresh
+    monkeypatch.setattr(service.time, "sleep", lambda s: (_ for _ in ()).throw(SystemExit))
+    import sqlite3 as _sq
+    con = _sq.connect(nightly_db / "harness.db")
+    con.execute("DELETE FROM households")
+    con.commit()
+    con.close()
+    try:
+        service.nightly()
+    except SystemExit:
+        pass
+    assert calls == ["last build has no household labels"]

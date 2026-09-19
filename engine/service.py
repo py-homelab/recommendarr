@@ -244,12 +244,25 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{datetime.now():%H:%M:%S} {self.address_string()} {fmt % args}")
 
 
+def households_built() -> bool:
+    """Whether the last build wrote household labels (a build from before v0.3.0 did not)."""
+    con = db.connect()
+    try:
+        con.executescript(build.HOUSEHOLD_SCHEMA)
+        return con.execute("SELECT COUNT(*) FROM households").fetchone()[0] > 0
+    finally:
+        con.close()
+
+
 def nightly() -> None:
-    """Build on start if there is no build or it is stale, then every day at BUILD_HOUR, so
-    a fresh deploy or a recreated container never serves an empty list."""
+    """Build on start if there is no build, it is stale, or it predates what this version serves
+    (household labels), then every day at BUILD_HOUR — so a fresh deploy or an upgrade never serves
+    an answer the nightly build would have filled in."""
     built = last_build()
     if built is None or time.time() - built > STALE_AFTER:
         run_build("no build yet" if built is None else "last build stale")
+    elif not households_built():
+        run_build("last build has no household labels")
     while True:
         now = datetime.now()
         target = now.replace(hour=BUILD_HOUR, minute=0, second=0, microsecond=0)
