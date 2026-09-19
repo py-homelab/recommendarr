@@ -15,6 +15,10 @@ ENV RECOMMENDARR_DATA=/data \
     PYTHONDONTWRITEBYTECODE=1
 
 # Runs as an arbitrary uid (the stack uses 568:568); nothing outside /data is written.
+# SQLite's sort spill goes to /data/tmp (harness/config.py), because production runs with a
+# read-only rootfs and no writable /tmp. To test that locally with podman, pass BOTH
+# `--read-only --read-only-tmpfs=false`: podman's --read-only alone still mounts a writable /tmp,
+# unlike Compose's `read_only`, and hides the failure (docs/results.md, the 2026-09 incident).
 RUN mkdir -p /data && chown 568:568 /data
 USER 568:568
 VOLUME ["/data"]
