@@ -9,9 +9,9 @@ GET /api/suggestions/<plex_id>?limit=200&family=exclude|include|only
         poster_path, overview, kids, why: [{seed, seed_tmdb_id, media_type}]}]}
 
 For Shortlist (the engine protocol, docs/guides/engines.md in the Shortlist fork):
-GET  /v1/info       -> {"name", "version", "surfaces", "serves_cold", "ready", "built_at"}
+GET  /v1/info       -> {"name", "version", "surfaces", "features", "serves_cold", "ready", "built_at", ...}
 POST /v1/recommend  <- {plex_account_id, surface, media, limit_per_media, library, exclude,
-                        excluded_genres, seeds, history, ...}
+                        excluded_genres, seeds, seed_focus, season, history, ...}
                     -> {"engine", "ordered": true, "items": [...], "trace": {...}}
 Optional ENGINE_TOKEN: when set, /v1/* requires `Authorization: Bearer <token>`.
 """
@@ -20,6 +20,7 @@ import hmac
 import json
 import os
 import signal
+import sqlite3
 import threading
 import time
 import traceback
@@ -33,7 +34,11 @@ from harness.llm import GENRES
 from . import build
 
 NAME = "recommendarr"
-VERSION = "0.3.1"
+VERSION = "0.4.0"
+# What this engine does with the request beyond ranking, so Shortlist can say when a row setting has
+# no effect: `season` narrows the candidates to the season's titles before the cut, `seed_focus` ranks
+# by closeness to the request's seeds instead of the person's whole taste.
+FEATURES = ["season", "seed_focus"]
 PORT = int(os.environ.get("ENGINE_PORT", "8090"))
 BUILD_HOUR = int(os.environ.get("ENGINE_BUILD_HOUR", "4"))
 TOKEN = os.environ.get("ENGINE_TOKEN", "")
@@ -158,6 +163,52 @@ def _reason(why: list[dict]) -> str | None:
     return f"Because you watched {first['seed']}"
 
 
+def _focus(con, seeds: list, rows: list) -> tuple[list, dict] | None:
+    """The person's list re-ranked by closeness to a few watches (a "Because you watched X" row).
+
+    A title's score is its summed similarity to the seeds, times a milder pull toward where the
+    person's own ranking put it (0.5 at the bottom of their list, 1.0 at the top), so the row is about
+    those watches first and this person's taste second. Titles like none of the seeds drop out.
+    None when the build has no neighbour table yet (a build from before v0.4.0): unfocused, not wrong.
+    """
+    weights: dict[tuple, tuple[float, str]] = {}
+    for s in seeds:
+        try:
+            weights[(int(s["tmdb_id"]), str(s["media_type"]))] = (float(s.get("weight") or 1.0), str(s.get("title") or ""))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not weights:
+        return None
+    marks = ",".join("(?,?)" for _ in weights)
+    try:
+        found = con.execute(
+            f"SELECT tmdb_id, media_type, n_tmdb_id, n_media_type, sim FROM item_neighbours WHERE (tmdb_id, media_type) IN ({marks})",
+            [v for k in weights for v in k],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    score: dict[tuple, float] = {}
+    best: dict[tuple, tuple[tuple, float]] = {}
+    for r in found:
+        seed, cand = (r[0], r[1]), (r[2], r[3])
+        v = weights[seed][0] * r[4]
+        score[cand] = score.get(cand, 0.0) + v
+        if v > best.get(cand, (None, 0.0))[1]:
+            best[cand] = (seed, v)
+    n = max(len(rows), 1)
+    placed = [
+        (score[k] * (0.5 + 0.5 * (1 - i / n)), r)
+        for i, r in enumerate(rows)
+        if (k := (r["tmdb_id"], r["media_type"])) in score
+    ]
+    placed.sort(key=lambda p: -p[0])
+    why = {
+        cand: [{"seed": weights[seed][1], "seed_tmdb_id": seed[0], "media_type": seed[1], "kind": "similar"}]
+        for cand, (seed, _v) in best.items()
+    }
+    return [r for _s, r in placed], why
+
+
 def recommend(req: dict) -> dict:
     """The engine protocol's answer for one request, straight from the nightly tables.
 
@@ -175,6 +226,11 @@ def recommend(req: dict) -> dict:
     library = {m: set(ids) for m, ids in (req.get("library") or {}).items()}
     exclude = {(int(t), m) for t, m in (req.get("exclude") or [])}
     excluded_genres = {GENRE_IDS[g.lower()] for g in req.get("excluded_genres") or [] if g.lower() in GENRE_IDS}
+    # A seasonal row: its season's titles are the candidates, cut after narrowing, not before.
+    season = req.get("season") if isinstance(req.get("season"), dict) else None
+    season_ids = {m: {int(t) for t in ids} for m, ids in season.items()} if season else None
+    focus_why: dict = {}
+    focused = None
     con = db.connect()
     try:
         rows = con.execute(
@@ -190,6 +246,11 @@ def recommend(req: dict) -> dict:
                     [v for r in rows for v in (r["tmdb_id"], r["media_type"])],
                 )
             }
+        ranked_total = len(rows)
+        if req.get("seed_focus") and req.get("seeds"):
+            focused = _focus(con, req["seeds"], rows)
+            if focused is not None:
+                rows, focus_why = focused
         built = con.execute("SELECT MAX(built_at) FROM builds").fetchone()[0]
         con.executescript(build.HOUSEHOLD_SCHEMA)
         hh = con.execute("SELECT * FROM households WHERE plex_id = ?", (plex_id,)).fetchone()
@@ -206,6 +267,8 @@ def recommend(req: dict) -> dict:
             fate = "other_media"
         elif surface == "library" and library and key[0] not in library.get(key[1], ()):
             fate = "not_in_these_libraries"
+        elif season_ids is not None and key[0] not in season_ids.get(key[1], ()):
+            fate = "not_in_season"
         elif surface == "missing" and key[0] in library.get(key[1], ()):
             fate = "in_library"
         elif key in exclude:
@@ -218,7 +281,7 @@ def recommend(req: dict) -> dict:
             dropped[fate] = dropped.get(fate, 0) + 1
             continue
         per_media[key[1]] += 1
-        why = json.loads(r["why"] or "[]")
+        why = focus_why.get(key) or json.loads(r["why"] or "[]")
         items.append({
             "tmdb_id": r["tmdb_id"], "media_type": r["media_type"], "title": r["title"], "year": r["year"],
             "genres": [GENRES.get(g, str(g)) for g in genres.get(key, [])],
@@ -242,7 +305,9 @@ def recommend(req: dict) -> dict:
         ),
         "items": items,
         "trace": {
-            "built_at": built, "surface": surface, "ranked": len(rows), "returned": len(items), "dropped": dropped,
+            "built_at": built, "surface": surface, "ranked": ranked_total, "returned": len(items), "dropped": dropped,
+            **({"seed_focus": {"seeds": len(req.get("seeds") or []), "like_them": len(rows),
+                               "applied": focused is not None}} if req.get("seed_focus") else {}),
             # How the caller's view of this person compares with Tautulli's: a wide gap means one of
             # the two histories is stale, which is worth seeing before wondering about the ranking.
             "history_sent": sent_history, "history_known": known_history,
@@ -301,7 +366,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorised():
                 return self._json(401, {"error": "bad token"})
             return self._json(200, {
-                "name": NAME, "version": VERSION, "surfaces": sorted(build.SURFACES), "serves_cold": True,
+                "name": NAME, "version": VERSION, "surfaces": sorted(build.SURFACES), "features": FEATURES,
+                "serves_cold": True,
                 **build_status(),
             })
         if len(parts) == 3 and parts[:2] == ["api", "suggestions"] and parts[2].isdigit():
@@ -325,6 +391,16 @@ def households_built() -> bool:
         con.close()
 
 
+def neighbours_built() -> bool:
+    """Whether the last build wrote the neighbour table and full library lists (v0.4.0)."""
+    con = db.connect()
+    try:
+        con.executescript(build.NEIGHBOURS_SCHEMA)
+        return con.execute("SELECT 1 FROM item_neighbours LIMIT 1").fetchone() is not None
+    finally:
+        con.close()
+
+
 def nightly() -> None:
     """Build on start if there is no build, it is stale, or it predates what this version serves
     (household labels), then every day at BUILD_HOUR — so a fresh deploy or an upgrade never serves
@@ -334,6 +410,8 @@ def nightly() -> None:
         run_build("no build yet" if built is None else "last build stale")
     elif not households_built():
         run_build("last build has no household labels")
+    elif not neighbours_built():
+        run_build("last build predates focused rows and full library lists")
     while True:
         now = datetime.now()
         target = now.replace(hour=BUILD_HOUR, minute=0, second=0, microsecond=0)

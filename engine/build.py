@@ -15,7 +15,8 @@ from harness import blend, catalogue, content, data, engagement, graph, llm, mov
 from harness.data import Key, Seed, UserContext
 
 MIN_SEEDS = 3                 # below this a user gets the household/popularity fallback
-LIST_SIZE = 300
+LIST_SIZE = 300               # the missing surface; the library surface ranks the whole library
+NEIGHBOURS = 100              # per library title, for rows focused on one or a few watches
 MOVIE_OBTAINABLE_LAG_DAYS = 45   # theatrical → digital, a heuristic until release types are used
 RECENT_YEARS = 2              # catalogue refresh re-discovers only these years nightly
 WHY_SEEDS = 3
@@ -51,6 +52,25 @@ CREATE TABLE IF NOT EXISTS builds (built_at INTEGER PRIMARY KEY, users INTEGER, 
 """
 
 SURFACES = {"missing": "suggestions", "library": "library_suggestions"}
+# The library surface is ranked in full: Shortlist's rows narrow it (a season, one person's libraries,
+# unstarted shows, draw-without-replacement across rows), and a cap there left a seasonal row with
+# whatever of its season happened to make the head. ~1,900 titles per person.
+SURFACE_LIMITS = {"missing": LIST_SIZE, "library": None}
+
+# Each library title's nearest library titles by content (TF-IDF over keywords, genres, cast, crew …;
+# averaged with gemini-embedding-2 where both titles have one, as the shows blend weights it). What a
+# row focused on a few watches ("Because you watched X") ranks by — see service.recommend.
+NEIGHBOURS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS item_neighbours (
+    tmdb_id INTEGER NOT NULL,
+    media_type TEXT NOT NULL,
+    n_tmdb_id INTEGER NOT NULL,
+    n_media_type TEXT NOT NULL,
+    sim REAL NOT NULL,
+    built_at INTEGER NOT NULL,
+    PRIMARY KEY (tmdb_id, media_type, n_tmdb_id, n_media_type)
+);
+"""
 
 # Household label per person, from their own last 12 months of positives (children's titles by
 # `signals.is_kids`). Measured 2026-09-19 on 12 accounts: two mixed family accounts at 35% and 49%,
@@ -158,7 +178,34 @@ def contexts_now(con, items, surface="missing") -> dict[int, UserContext]:
     return data._contexts(con, users, now, universe)
 
 
-def popularity_fallback(ctx: UserContext, items, years=3) -> list[Key]:
+def write_neighbours(con, items, space: content.ItemSpace, embeddings, built_at: int) -> int:
+    """Top-NEIGHBOURS library titles per library title (both media), written whole each build."""
+    library = sorted({(r[0], r[1]) for r in con.execute("SELECT tmdb_id, media_type FROM library")} & space.index.keys())
+    con.executescript(NEIGHBOURS_SCHEMA)
+    con.execute("DELETE FROM item_neighbours")
+    if len(library) < 2:
+        return 0
+    X = space.X[[space.index[k] for k in library]]
+    sims = (X @ X.T).toarray().astype(np.float32)
+    if embeddings is not None and len(getattr(embeddings, "keys", [])):
+        has = np.array([k in embeddings.index for k in library])
+        rows = np.flatnonzero(has)
+        if len(rows) > 1:
+            E = embeddings.X[[embeddings.index[library[i]] for i in rows]]
+            E = E.toarray() if hasattr(E, "toarray") else np.asarray(E)
+            both = np.ix_(rows, rows)
+            sims[both] = 0.5 * sims[both] + 0.5 * np.maximum(E @ E.T, 0)
+    np.fill_diagonal(sims, 0)
+    k = min(NEIGHBOURS, len(library) - 1)
+    out = []
+    for i, key in enumerate(library):
+        top = np.argpartition(-sims[i], k - 1)[:k]
+        out.extend((key[0], key[1], library[j][0], library[j][1], float(sims[i, j]), built_at) for j in top if sims[i, j] > 0)
+    con.executemany("INSERT INTO item_neighbours VALUES (?,?,?,?,?,?)", out)
+    return len(out)
+
+
+def popularity_fallback(ctx: UserContext, items, years=3, limit: int | None = LIST_SIZE) -> list[Key]:
     """Too few seeds to rank from: recent titles by votes first, then everything else by votes
     (on the library surface the recent slice alone can be a handful)."""
     floor = str(date.today().year - years)
@@ -167,7 +214,7 @@ def popularity_fallback(ctx: UserContext, items, years=3) -> list[Key]:
         it = items[k]
         return (not (it.release_date and it.release_date >= floor), -it.vote_count)
 
-    return sorted(ctx.candidates, key=key)[:LIST_SIZE]
+    return sorted(ctx.candidates, key=key)[:limit]
 
 
 def explain(space: content.ItemSpace, ctx: UserContext, key: Key, items, continuations) -> list[dict]:
@@ -196,8 +243,9 @@ def build(con) -> None:
     refresh_catalogue(con)
 
     items = data.load_items(con)
-    space = llm.EmbeddingSpace(con, items)
-    scorer = signals.IntentSeeds(tune.final_blend(space if len(space.keys) else None), signals.requests_by_user(con))
+    embeddings = llm.EmbeddingSpace(con, items)
+    embeddings = embeddings if len(embeddings.keys) else None
+    scorer = signals.IntentSeeds(tune.final_blend(embeddings), signals.requests_by_user(con))
     # `prepare` builds the cross-user state (the household, the EASE fold-in) from the contexts'
     # seeds, which are the same on both surfaces — only the candidate universe differs.
     contexts = contexts_now(con, items, "missing")
@@ -207,6 +255,7 @@ def build(con) -> None:
     meta = {(r["tmdb_id"], r["media_type"]): r for r in con.execute("SELECT tmdb_id, media_type, poster_path, overview FROM items")}
     labels = write_households(con, items, built_at)
     print("households:", {k: sum(1 for v in labels.values() if v == k) for k in ("adult", "family", "kids")})
+    print("neighbour pairs:", write_neighbours(con, items, space, embeddings, built_at))
     users = 0
     for surface, table in SURFACES.items():
         if surface != "missing":
@@ -215,7 +264,7 @@ def build(con) -> None:
         for u, ctx in contexts.items():
             con.executemany(
                 f"INSERT OR REPLACE INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                rank_user(scorer, space, ctx, items, meta, u, built_at),
+                rank_user(scorer, space, ctx, items, meta, u, built_at, limit=SURFACE_LIMITS[surface]),
             )
         users = len(contexts)
     seconds = time.time() - started
@@ -225,20 +274,27 @@ def build(con) -> None:
           f"{datetime.fromtimestamp(built_at, timezone.utc):%Y-%m-%d %H:%M}Z")
 
 
-def rank_user(scorer, space, ctx: UserContext, items, meta, plex_id: int, built_at: int) -> list[tuple]:
-    """One person's ranked list over the context's candidates, as rows for either surface table."""
+def rank_user(
+    scorer, space, ctx: UserContext, items, meta, plex_id: int, built_at: int, limit: int | None = LIST_SIZE
+) -> list[tuple]:
+    """One person's ranked list over the context's candidates, as rows for either surface table.
+    `limit` None ranks every candidate: titles the blend could not score follow by votes."""
     if len(ctx.seeds) >= MIN_SEEDS:
         scores = scorer(ctx, items)
-        order = sorted(scores, key=lambda k: -scores[k])[:LIST_SIZE]
+        order = sorted(scores, key=lambda k: -scores[k])
+        if limit is None:
+            scored = set(order)
+            order += sorted((k for k in ctx.candidates if k not in scored), key=lambda k: -items[k].vote_count)
+        order = order[:limit]
         continuations = scorer.scorer.last_continuations
     else:
-        order, continuations = popularity_fallback(ctx, items), {}
+        order, continuations = popularity_fallback(ctx, items, limit=limit), {}
     rows = []
     for rank, k in enumerate(order):
         it = items[k]
         rows.append((
             plex_id, rank, k[0], k[1], it.title, it.year, it.vote_average, it.vote_count,
             meta[k]["poster_path"], meta[k]["overview"], int(signals.is_kids(it)),
-            json.dumps(explain(space, ctx, k, items, continuations)), float(LIST_SIZE - rank), built_at,
+            json.dumps(explain(space, ctx, k, items, continuations)), float(len(order) - rank), built_at,
         ))
     return rows

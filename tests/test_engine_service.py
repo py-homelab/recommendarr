@@ -267,3 +267,120 @@ def test_fresh_lists_are_healthy(server):
     assert _call(server, "/v1/recommend", {"plex_account_id": 100}, token="s3cret")[0] == 200
     status, info = _call(server, "/v1/info", token="s3cret")
     assert info["ready"] is True and "last_build_error" in info
+
+
+def _neighbours(nightly_db, pairs):
+    con = sqlite3.connect(nightly_db / "harness.db")
+    con.executescript(build.NEIGHBOURS_SCHEMA)
+    con.executemany("INSERT INTO item_neighbours VALUES (?,?,?,?,?,1000)", pairs)
+    con.commit()
+    con.close()
+
+
+def test_a_season_narrows_the_candidates_before_the_cut(nightly_db):
+    out = service.recommend({
+        "plex_account_id": 100, "surface": "library", "limit_per_media": 1,
+        "season": {"movie": [10], "show": [30]},
+    })
+    # 20 ranks first overall but is not in the season; the season's own titles fill the per-media limit.
+    assert [i["tmdb_id"] for i in out["items"]] == [10, 30]
+    assert out["trace"]["dropped"] == {"not_in_season": 1}
+
+
+def test_seed_focus_ranks_by_closeness_to_those_watches(nightly_db):
+    _neighbours(nightly_db, [(900, "movie", 30, "show", 0.9), (900, "movie", 10, "movie", 0.2)])
+    out = service.recommend({
+        "plex_account_id": 100, "surface": "library", "seed_focus": True,
+        "seeds": [{"tmdb_id": 900, "media_type": "movie", "title": "Fargo", "weight": 1.0}],
+    })
+    # 20 is the person's top title but is like nothing in the focus; 30 is the closest to Fargo.
+    assert [i["tmdb_id"] for i in out["items"]] == [30, 10]
+    assert out["items"][0]["reason"] == "Because you watched Fargo"
+    assert out["items"][0]["seed"] == {"tmdb_id": 900, "title": "Fargo", "media_type": "movie"}
+    assert out["trace"]["seed_focus"] == {"seeds": 1, "like_them": 2, "applied": True}
+    assert out["trace"]["ranked"] == 3
+
+
+def test_seed_focus_without_a_neighbour_table_answers_unfocused(nightly_db):
+    out = service.recommend({
+        "plex_account_id": 100, "surface": "library", "seed_focus": True,
+        "seeds": [{"tmdb_id": 900, "media_type": "movie", "title": "Fargo"}],
+    })
+    assert [i["tmdb_id"] for i in out["items"]] == [20, 10, 30]
+    assert out["trace"]["seed_focus"]["applied"] is False
+
+
+def test_info_names_the_features(server):
+    status, info = _call(server, "/v1/info", token="s3cret")
+    assert status == 200 and info["features"] == ["season", "seed_focus"]
+
+
+def test_a_build_without_neighbours_is_rebuilt_on_start(nightly_db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, "run_build", lambda reason: calls.append(reason))
+    monkeypatch.setattr(service, "last_build", lambda: 10**10)  # fresh
+    monkeypatch.setattr(service.time, "sleep", lambda s: (_ for _ in ()).throw(SystemExit))
+    try:
+        service.nightly()
+    except SystemExit:
+        pass
+    assert calls == ["last build predates focused rows and full library lists"]
+    _neighbours(nightly_db, [(900, "movie", 30, "show", 0.9)])
+    calls.clear()
+    try:
+        service.nightly()
+    except SystemExit:
+        pass
+    assert calls == []
+
+
+def _item(tid, media, genres, keywords, votes=100):
+    from harness.data import Item
+
+    return (tid, media), Item(
+        (tid, media), f"t{tid}", 2020, "2020-01-01", genres, keywords, [], [], "en", "PG", None, 100, None,
+        7.0, votes, 1.0, [], [], True,
+    )
+
+
+def test_neighbours_are_the_closest_library_titles_and_never_the_title_itself(tmp_path, monkeypatch):
+    from harness import content
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "harness.db")
+    items = dict([
+        _item(1, "movie", [27], [5, 6]), _item(2, "movie", [27], [5, 6]), _item(3, "movie", [35], [7]),
+        _item(4, "show", [27], [5]), _item(5, "movie", [27], [5, 6]),  # 5 is not in the library
+    ])
+    con = db.connect()
+    con.executemany("INSERT INTO library VALUES (?,?,NULL,NULL)", [(1, "movie"), (2, "movie"), (3, "movie"), (4, "show")])
+    n = build.write_neighbours(con, items, content.ItemSpace(items), None, 1000)
+    got = {}
+    for r in con.execute("SELECT tmdb_id, n_tmdb_id, sim FROM item_neighbours ORDER BY sim DESC"):
+        got.setdefault(r[0], []).append(r[1])
+    con.close()
+    assert n > 0
+    assert got[1][0] == 2 and 1 not in got[1] and 5 not in got[1]
+    assert got[4][0] in (1, 2)
+
+
+def test_the_library_surface_ranks_every_candidate():
+    from harness.data import UserContext
+    from harness.data import Seed as S
+
+    items = dict([_item(i, "movie", [18], [i], votes=i) for i in range(1, 6)])
+
+    class Scorer:
+        class scorer:
+            last_continuations = {}
+
+        def __call__(self, ctx, items):
+            return {(1, "movie"): 2.0, (2, "movie"): 1.0}  # the blend scored only two
+
+    ctx = UserContext(
+        user_id=1, cutoff=0, seeds=[S((9, "movie"), 1.0, 0, 0, 1.0)] * 3, negatives=set(), candidates=set(items),
+        household_seeds={}, household_requests={},
+    )
+    meta = {k: {"poster_path": "", "overview": ""} for k in items}
+    rows = build.rank_user(Scorer(), type("Space", (), {"index": {}})(), ctx, items, meta, 1, 1000, limit=None)
+    assert [r[2] for r in rows] == [1, 2, 5, 4, 3]  # scored first, then the rest by votes

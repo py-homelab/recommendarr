@@ -188,8 +188,8 @@ uv run python -m engine build   # nightly job: pull, resolve, engagement, catalo
 uv run python -m engine serve   # HTTP on :8090 (+ nightly build thread at ENGINE_BUILD_HOUR)
 GET  /healthz
 GET  /api/suggestions/<plex_id>?limit=200&family=exclude|include|only     # picks: the missing surface
-GET  /v1/info                                                             # Shortlist engine protocol (v0.2.0)
-POST /v1/recommend  {plex_account_id, surface: library|missing, media, limit_per_media, library, exclude, …}
+GET  /v1/info                                                             # Shortlist engine protocol (+ features, v0.4.0)
+POST /v1/recommend  {plex_account_id, surface: library|missing, media, limit_per_media, library, exclude, season, seeds, seed_focus, …}
 ```
 
 The `/v1` endpoints are the engine protocol the Shortlist fork (`py-homelab/shortlist`, branch
@@ -199,6 +199,14 @@ the `suggestions` table; the request's `library`/`exclude`/`excluded_genres` are
 the order is final, `kids` and a `reason` ride on every item. `ENGINE_TOKEN` (optional) gates
 `/v1/*` with a bearer token. Shortlist's own history is not used for ranking (Tautulli has the
 device signal); the trace reports `history_sent` vs `history_known` so a stale side shows.
+
+Row settings (v0.4.0): the library surface ranks each person's WHOLE library (the missing surface
+stays at 300), `season` narrows the candidates before the per-media cut, and `seed_focus` re-ranks by
+closeness to the request's seeds via the nightly `item_neighbours` table (top 100 library neighbours
+per library title: TF-IDF content, averaged with gemini embeddings where both titles have one).
+`/v1/info` lists `features: ["season", "seed_focus"]`. A start on a build without neighbours rebuilds.
+The fork draws rows without replacement from one engine answer, re-weights a row's own `recency`, and
+builds rows that name their own sources with Shortlist's built-in engine.
 
 Household label (v0.3.0): the nightly build writes `households(plex_id, label, kids_share,
 kids_titles, window_titles)` from each person's last 12 months of positives (children's titles by
