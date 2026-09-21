@@ -51,6 +51,7 @@ def nightly_db(tmp_path, monkeypatch):
             f"INSERT INTO {table} VALUES (?,?,?,?,?,2020,7.5,1000,'/p.jpg','about it',?,?,?,1000)",
             (100, rank, tmdb_id, media, title, kids, w, 300 - rank),
         )
+    con.execute("INSERT INTO users (user_id, username) VALUES (100, 'owner')")
     con.execute("INSERT INTO builds VALUES (1000, 1, 1.0, 0)")
     con.execute("INSERT INTO builds VALUES (?, 1, 1.0, 0)", (int(__import__("time").time()),))  # fresh
     con.executescript(build.HOUSEHOLD_SCHEMA)
@@ -420,3 +421,303 @@ def test_a_new_version_rebuilds_on_start(nightly_db, monkeypatch):
     except SystemExit:
         pass
     assert calls == [f"last build was made by 0.4.0, not {service.VERSION}"]
+
+
+# --- pooled household profiles (ENGINE_IDENTITY_GROUPS) -------------------------------------------
+
+
+def _library_request(plex_id: int) -> dict:
+    return {"plex_account_id": plex_id, "surface": "library", "library": {"movie": [10, 20], "show": [30]}}
+
+
+def test_a_pooled_profile_is_answered_with_its_households_lists(nightly_db, monkeypatch):
+    """The children's profile (777) has no lists of its own — the build never ranks a pooled member —
+    so without this it would get an empty answer and Shortlist would fall back to its own engine."""
+    monkeypatch.setenv(service.identity.ENV, "100:777,778")
+
+    out = service.recommend(_library_request(777))
+
+    assert [i["tmdb_id"] for i in out["items"]] == [20, 10, 30]
+    assert out["trace"]["answered_as"] == 100
+    assert out["trace"]["history_known"] == 1
+
+
+def test_every_account_in_a_group_is_told_so_and_gets_the_same_counts(nightly_db, monkeypatch):
+    """The counts cannot tell the profiles apart — that is the caller's job, by pinning each one —
+    and `group` is how the caller can notice two grouped accounts it has left unpinned."""
+    monkeypatch.setenv(service.identity.ENV, "100:777,778")
+
+    member = service.recommend(_library_request(777))["household"]
+    canonical = service.recommend(_library_request(100))["household"]
+
+    assert member == canonical
+    assert member["group"] == 100 and member["kids_titles"] == 66
+
+
+def test_with_no_map_nothing_about_the_answer_changes(nightly_db, monkeypatch):
+    monkeypatch.delenv(service.identity.ENV, raising=False)
+
+    out = service.recommend(_library_request(100))
+
+    assert "group" not in out["household"]
+    assert "answered_as" not in out["trace"]
+    assert service.recommend(_library_request(777))["items"] == []
+
+
+def test_the_picks_endpoint_reads_the_households_list_too(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+
+    assert [i["tmdb_id"] for i in service.fetch(777, 10, "include")["items"]] == [40, 50]
+
+
+def test_changing_the_map_is_a_reason_to_rebuild_and_leaving_it_unset_is_not(nightly_db, monkeypatch):
+    monkeypatch.delenv(service.identity.ENV, raising=False)
+    assert service.identity_built() == service.identity.normalised() == ""  # unset, never built with one
+
+    monkeypatch.setenv(service.identity.ENV, "100:778, 777")
+    assert service.identity_built() != service.identity.normalised()
+
+    con = db.connect()
+    con.executescript(build.META_SCHEMA)
+    con.execute("INSERT OR REPLACE INTO engine_meta VALUES ('identity_groups', '100:777,778')")
+    con.commit()
+    con.close()
+    assert service.identity_built() == service.identity.normalised()  # same map, spelled differently
+
+
+def test_a_malformed_map_stops_the_service_at_start(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:100")
+    monkeypatch.setattr(service.db, "check_temp_dir", lambda: None)
+
+    def _reached_the_listener(*_a, **_kw):
+        # Without the check, `serve()` would really listen and this test would HANG rather than fail.
+        raise AssertionError("the service got as far as opening its port")
+
+    monkeypatch.setattr(service, "ThreadingHTTPServer", _reached_the_listener)
+    monkeypatch.setattr(service.threading, "Thread", lambda *a, **kw: type("T", (), {"start": lambda self: None})())
+
+    with pytest.raises(SystemExit, match="its own member"):
+        service.serve()
+
+
+def test_check_groups_exits_non_zero_on_a_bad_map_and_zero_on_a_good_or_absent_one(nightly_db, monkeypatch, capsys):
+    from engine.__main__ import check_groups
+
+    monkeypatch.setenv(service.identity.ENV, "100:one")
+    assert check_groups() == 2
+    assert "INVALID" in capsys.readouterr().err
+
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+    assert check_groups() == 0
+    assert "group 100: 777" in capsys.readouterr().out
+
+    monkeypatch.delenv(service.identity.ENV)
+    assert check_groups() == 0
+
+
+def _nightly_once(monkeypatch) -> list[str]:
+    calls: list[str] = []
+    monkeypatch.setattr(service, "run_build", lambda reason: calls.append(reason))
+    monkeypatch.setattr(service, "last_build", lambda: 10**10)  # fresh
+    monkeypatch.setattr(service, "neighbours_built", lambda: True)
+    monkeypatch.setattr(service, "built_by", lambda: service.VERSION)
+    monkeypatch.setattr(service.time, "sleep", lambda s: (_ for _ in ()).throw(SystemExit))
+    with pytest.raises(SystemExit):
+        service.nightly()
+    return calls
+
+
+def test_a_new_identity_map_rebuilds_on_start(nightly_db, monkeypatch):
+    """Otherwise the profiles stay ungrouped until 03:00, answering from lists built without them."""
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+
+    assert _nightly_once(monkeypatch) == [f"{service.identity.ENV} changed since the last build"]
+
+
+def test_an_unset_map_never_rebuilds_a_build_that_had_none(nightly_db, monkeypatch):
+    """The strict no-op: shipping this version with the variable unset must not cost a rebuild for it."""
+    monkeypatch.delenv(service.identity.ENV, raising=False)
+
+    assert _nightly_once(monkeypatch) == []
+
+
+def test_the_build_hands_the_map_to_the_engagement_table(nightly_db, monkeypatch):
+    """The seam between the map and the one table every scorer reads. `engagement.run` pooling
+    correctly is no use if the nightly build never hands it the map."""
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+    handed = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _engagements(con, aliases=None):
+        handed["aliases"] = aliases
+        raise _Stop
+
+    monkeypatch.setattr(build.pull, "run", lambda con: None)
+    monkeypatch.setattr(build.resolve, "run", lambda con: None)
+    monkeypatch.setattr(build.engagement, "run", _engagements)
+
+    with pytest.raises(_Stop):
+        build.build(db.connect(), service.VERSION)
+
+    assert handed["aliases"] == {777: 100}
+
+
+def test_a_malformed_map_stops_a_build_before_it_pulls_anything(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:100")
+    monkeypatch.setattr(build.pull, "run", lambda con: pytest.fail("the build started pulling"))
+
+    with pytest.raises(ValueError, match="its own member"):
+        build.build(db.connect(), service.VERSION)
+
+
+def test_a_build_records_the_map_it_pooled_by_so_the_next_start_does_not_rebuild_for_it(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:778,777")
+    con = db.connect()
+
+    build.record_meta(con, service.VERSION, service.identity.members())
+    con.commit()
+    con.close()
+
+    assert service.identity_built() == "100:777,778" == service.identity.normalised()
+    assert service.built_by() == service.VERSION
+
+
+def test_an_account_outside_every_group_is_not_told_it_is_in_one(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "555:777")
+
+    out = service.recommend(_library_request(100))
+
+    assert "group" not in out["household"] and "answered_as" not in out["trace"]
+
+
+def test_the_picks_endpoint_answers_under_the_id_it_was_asked_for(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+
+    assert service.fetch(777, 10, "include")["plex_id"] == 777
+
+
+def test_the_whole_build_pools_requests_and_records_the_map_it_used(nightly_db, monkeypatch):
+    """The two wiring lines nothing else can see: the pooled requests reaching the scorer, and the
+    REAL map (not an empty one) reaching `engine_meta` — record `{}` there and every start rebuilds."""
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def _pull(con):
+        con.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (100, 'owner')")
+        con.execute("INSERT INTO seerr_requests VALUES (1, 777, 40, 'movie', 5, 2)")
+
+    def _scorer(blend, requests):
+        seen["requests"] = requests
+        raise _Stop
+
+    monkeypatch.setattr(build.pull, "run", _pull)
+    monkeypatch.setattr(build.resolve, "run", lambda con: None)
+    monkeypatch.setattr(build.engagement, "run", lambda con, aliases=None: None)
+    monkeypatch.setattr(build, "refresh_catalogue", lambda con: None)
+    monkeypatch.setattr(build.llm, "EmbeddingSpace", lambda con, items: type("E", (), {"keys": []})())
+    monkeypatch.setattr(build.tune, "final_blend", lambda embeddings: None)
+    monkeypatch.setattr(build.signals, "IntentSeeds", _scorer)
+
+    with pytest.raises(_Stop):
+        build.build(db.connect(), service.VERSION)
+
+    assert seen["requests"] == {100: [((40, "movie"), 5)]}
+
+
+def test_the_map_a_build_records_is_the_one_it_pooled_by(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+    recorded = {}
+    monkeypatch.setattr(build, "record_meta", lambda con, version, pooled: recorded.update(pooled=pooled))
+    monkeypatch.setattr(build.pull, "run", lambda con: con.execute("INSERT OR IGNORE INTO users (user_id) VALUES (100)"))
+    monkeypatch.setattr(build.resolve, "run", lambda con: None)
+    monkeypatch.setattr(build.engagement, "run", lambda con, aliases=None: None)
+    monkeypatch.setattr(build, "refresh_catalogue", lambda con: None)
+    monkeypatch.setattr(build.llm, "EmbeddingSpace", lambda con, items: type("E", (), {"keys": []})())
+    scorer = type("S", (), {"prepare": lambda self, c, i: None, "scorer": type("B", (), {"components": [None, type("C", (), {"space": None})()]})()})()
+    monkeypatch.setattr(build.tune, "final_blend", lambda embeddings: None)
+    monkeypatch.setattr(build.signals, "IntentSeeds", lambda blend, requests: scorer)
+    monkeypatch.setattr(build, "contexts_now", lambda con, items, surface="missing": {})
+    monkeypatch.setattr(build, "write_households", lambda con, items, built_at: {})
+    monkeypatch.setattr(build, "write_neighbours", lambda *a, **kw: 0)
+    con = db.connect()
+    con.execute("DELETE FROM builds")  # the fixture's fresh build carries this very second
+    con.commit()
+
+    build.build(con, service.VERSION)
+
+    assert recorded["pooled"] == {777: 100}
+
+
+def test_check_groups_creates_nothing_and_survives_a_database_it_cannot_read(tmp_path, monkeypatch, capsys):
+    import subprocess
+    import sys
+
+    data = tmp_path / "data"
+    env = {**__import__("os").environ, "RECOMMENDARR_DATA": str(data), service.identity.ENV: "100:777"}
+    env.pop("SQLITE_TMPDIR", None)
+
+    done = subprocess.run([sys.executable, "-m", "engine", "check-groups"], env=env, capture_output=True, text=True)
+
+    assert done.returncode == 0
+    assert "group 100: 777" in done.stdout and "no database at" in done.stdout
+    assert not data.exists()  # not even the directory
+
+    # Mounted READ-ONLY, which is how the command says to run it: nothing can be left behind, and a
+    # database it cannot make sense of costs the id check, not the verdict on the map.
+    data.mkdir()
+    (data / "harness.db").write_bytes(b"this is not a database")
+    data.chmod(0o555)
+    try:
+        done = subprocess.run(
+            [sys.executable, "-m", "engine", "check-groups"], env=env, capture_output=True, text=True
+        )
+    finally:
+        data.chmod(0o755)
+
+    assert done.returncode == 0
+    assert "could not read the users table" in done.stdout
+    assert sorted(p.name for p in data.iterdir()) == ["harness.db"]
+
+
+def test_check_groups_exits_3_for_a_map_the_build_would_refuse(nightly_db, monkeypatch, capsys):
+    """Well-formed, so the service would start — and then every build would refuse it. Whoever is
+    promoting the value wants to hear that before it ships, from the exit code they already gate on."""
+    from engine.__main__ import check_groups
+
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+    assert check_groups() == 0
+
+    monkeypatch.setenv(service.identity.ENV, "101:777")
+    assert check_groups() == 3
+    assert "REFUSES" in capsys.readouterr().out
+
+
+def test_a_map_the_lists_were_not_built_with_is_flagged_in_the_trace(nightly_db, monkeypatch):
+    monkeypatch.setenv(service.identity.ENV, "100:777")
+    assert service.recommend(_library_request(777))["trace"]["identity_pending"] is True
+
+    con = db.connect()
+    build.record_meta(con, service.VERSION, service.identity.members())
+    con.commit()
+    con.close()
+    assert "identity_pending" not in service.recommend(_library_request(777))["trace"]
+
+
+def test_the_build_itself_refuses_a_canonical_tautulli_does_not_know(nightly_db, monkeypatch):
+    """After the pull (the users table has to be current to judge) and before anything is rebuilt, so
+    last night's lists stay in place and the reason lands in the build log and /healthz."""
+    monkeypatch.setenv(service.identity.ENV, "101:777")
+    monkeypatch.setattr(build.pull, "run", lambda con: None)
+    monkeypatch.setattr(build.resolve, "run", lambda con: pytest.fail("the build carried on past the check"))
+
+    with pytest.raises(ValueError, match="canonical account 101 is not a user Tautulli knows"):
+        build.build(db.connect(), service.VERSION)
+
+    con = db.connect()
+    assert con.execute("SELECT COUNT(*) FROM library_suggestions WHERE plex_id = 100").fetchone()[0] == 3
+    con.close()

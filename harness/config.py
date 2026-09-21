@@ -22,9 +22,11 @@ def _writable(path: str | None) -> bool:
     return bool(path) and os.path.isdir(path) and os.access(path, os.W_OK)
 
 
-if not _writable(os.environ.get("SQLITE_TMPDIR")):
+# Only under a data directory that EXISTS. Creating the directory itself from an import meant a
+# command that reads nothing and writes nothing (`engine check-groups`) still left one behind.
+if not _writable(os.environ.get("SQLITE_TMPDIR")) and DATA_DIR.is_dir():
     try:
-        TMP_DIR.mkdir(parents=True, exist_ok=True)
+        TMP_DIR.mkdir(exist_ok=True)
         os.environ["SQLITE_TMPDIR"] = str(TMP_DIR)
         if not _writable(os.environ.get("TMPDIR")):
             os.environ["TMPDIR"] = str(TMP_DIR)

@@ -31,10 +31,10 @@ from urllib.parse import parse_qs, urlparse
 from harness import db
 from harness.llm import GENRES
 
-from . import build
+from . import build, identity
 
 NAME = "recommendarr"
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 # What this engine does with the request beyond ranking, so Shortlist can say when a row setting has
 # no effect: `season` narrows the candidates to the season's titles before the cut, `seed_focus` ranks
 # by closeness to the request's seeds instead of the person's whole taste.
@@ -135,7 +135,8 @@ def fetch(plex_id: int, limit: int, family: str) -> dict:
     try:
         where = {"exclude": "AND kids = 0", "only": "AND kids = 1"}.get(family, "")
         rows = con.execute(
-            f"SELECT * FROM suggestions WHERE plex_id = ? {where} ORDER BY rank LIMIT ?", (plex_id, limit)
+            f"SELECT * FROM suggestions WHERE plex_id = ? {where} ORDER BY rank LIMIT ?",
+            (identity.canonical(plex_id), limit),  # a pooled profile reads its household's list
         ).fetchall()
         built = con.execute("SELECT MAX(built_at) FROM builds").fetchone()[0]
     finally:
@@ -217,7 +218,9 @@ def recommend(req: dict) -> dict:
     applied as sent. The engine ranks from Tautulli's history, not the request's — that history is
     only counted against ours here so a mismatch shows in the trace.
     """
-    plex_id = int(req["plex_account_id"])
+    asked_for = int(req["plex_account_id"])
+    # A pooled household profile is answered with the canonical account's lists (`identity`).
+    plex_id = identity.canonical(asked_for)
     surface = req.get("surface") or "library"
     if surface not in build.SURFACES:
         raise ValueError(f"unknown surface {surface!r}")
@@ -257,6 +260,9 @@ def recommend(req: dict) -> dict:
         known_history = con.execute(
             "SELECT COUNT(*) FROM engagements WHERE user_id = ? AND label = 'positive'", (plex_id,)
         ).fetchone()[0]
+        con.executescript(build.META_SCHEMA)
+        recorded = con.execute("SELECT value FROM engine_meta WHERE key = 'identity_groups'").fetchone()
+        identity_pending = (recorded[0] if recorded else "") != identity.normalised()
     finally:
         con.close()
     items, per_media, dropped = [], {m: 0 for m in media}, {}
@@ -300,7 +306,12 @@ def recommend(req: dict) -> dict:
         # child's own account). Null when the engine has not built a label for this person yet.
         "household": (
             {"label": hh["label"], "kids_share": round(hh["kids_share"], 3), "kids_titles": hh["kids_titles"],
-             "window_titles": hh["window_titles"], "window_days": build.HOUSEHOLD_WINDOW_DAYS}
+             "window_titles": hh["window_titles"], "window_days": build.HOUSEHOLD_WINDOW_DAYS,
+             # The pooled household this account belongs to (its canonical id), when it is in one.
+             # Every account in a group gets the SAME counts above, so they cannot tell a children's
+             # profile from the adults' one: the caller has to pin each profile's label itself, and
+             # this field is how it can notice two grouped accounts it has left unpinned.
+             **({"group": identity.group_of(asked_for)} if identity.group_of(asked_for) is not None else {})}
             if hh else None
         ),
         "items": items,
@@ -311,6 +322,13 @@ def recommend(req: dict) -> dict:
             # How the caller's view of this person compares with Tautulli's: a wide gap means one of
             # the two histories is stale, which is worth seeing before wondering about the ranking.
             "history_sent": sent_history, "history_known": known_history,
+            # Answered from another account's lists: this one is pooled under it (`identity`). The
+            # gap above is then structural, not staleness — one profile's history was sent, the
+            # whole household's is known.
+            **({"answered_as": plex_id} if plex_id != asked_for else {}),
+            # The map changed and the rebuild for it has not finished (or failed): these lists were
+            # pooled by the OLD map, so a newly added profile is reading its household's pre-pooling list.
+            **({"identity_pending": True} if identity_pending else {}),
         },
     }
 
@@ -403,6 +421,17 @@ def built_by() -> str | None:
         con.close()
 
 
+def identity_built() -> str:
+    """The identity map the newest build pooled accounts by ("" when it pooled nobody, or predates it)."""
+    con = db.connect()
+    try:
+        con.executescript(build.META_SCHEMA)
+        row = con.execute("SELECT value FROM engine_meta WHERE key = 'identity_groups'").fetchone()
+        return row[0] if row else ""
+    finally:
+        con.close()
+
+
 def neighbours_built() -> bool:
     """Whether the last build wrote the neighbour table and full library lists (v0.4.0)."""
     con = db.connect()
@@ -414,9 +443,10 @@ def neighbours_built() -> bool:
 
 
 def nightly() -> None:
-    """Build on start if there is no build, it is stale, or it predates what this version serves
-    (household labels), then every day at BUILD_HOUR — so a fresh deploy or an upgrade never serves
-    an answer the nightly build would have filled in."""
+    """Build on start if there is no build, it is stale, it predates what this version serves
+    (household labels, neighbours, another engine version), or it pooled accounts by a different
+    identity map than the one set now; then every day at BUILD_HOUR — so a fresh deploy, an upgrade
+    or a changed map never serves an answer the nightly build would have filled in."""
     built = last_build()
     if built is None or time.time() - built > STALE_AFTER:
         run_build("no build yet" if built is None else "last build stale")
@@ -426,6 +456,8 @@ def nightly() -> None:
         run_build("last build predates focused rows and full library lists")
     elif built_by() != VERSION:
         run_build(f"last build was made by {built_by() or 'an older version'}, not {VERSION}")
+    elif identity_built() != identity.normalised():
+        run_build(f"{identity.ENV} changed since the last build")
     while True:
         now = datetime.now()
         target = now.replace(hour=BUILD_HOUR, minute=0, second=0, microsecond=0)
@@ -441,6 +473,12 @@ def serve() -> None:
         # Fail loudly at start: every build would die on its first big sort while the service kept
         # answering from its previous lists.
         raise SystemExit(f"engine cannot build: {problem}. Point SQLITE_TMPDIR at a writable directory.")
+    try:
+        identity.members()
+    except ValueError as e:
+        # At start, not at 03:00: a map the nightly build would choke on (or, worse, one quietly
+        # ignored) leaves a household's profiles ungrouped with nothing on screen to say so.
+        raise SystemExit(f"engine cannot start: {e}") from None
     threading.Thread(target=nightly, daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     # As PID 1 in a container Python ignores SIGTERM unless handled; stop serving cleanly.

@@ -186,6 +186,7 @@ automerge) a pin-bump PR in homelab-stacks. Source: `github.com/py-homelab/recom
 ```
 uv run python -m engine build   # nightly job: pull, resolve, engagement, catalogue refresh, rank all users (both surfaces)
 uv run python -m engine serve   # HTTP on :8090 (+ nightly build thread at ENGINE_BUILD_HOUR)
+uv run python -m engine check-groups   # validate ENGINE_IDENTITY_GROUPS, print the groups; exit 0/2/3; no build, no table changed
 GET  /healthz
 GET  /api/suggestions/<plex_id>?limit=200&family=exclude|include|only     # picks: the missing surface
 GET  /v1/info                                                             # Shortlist engine protocol (+ features, v0.4.0)
@@ -210,6 +211,26 @@ never (TMDB tags King of the Hill "Animation, Family"), G/TV-G and unrated only 
 A start on a build made by another engine version rebuilds (`engine_meta.built_by`).
 The fork draws rows without replacement from one engine answer, re-weights a row's own `recency`, and
 builds rows that name their own sources with Shortlist's built-in engine.
+
+Identity groups (v0.5.0, `engine/identity.py`): `ENGINE_IDENTITY_GROUPS="895220:856697834,856698746"`
+(canonical:member,member; `;` between groups) pools several Plex accounts as one household — the owner
+account plus the Adults and Kids Plex Home profiles. Applied where engagements are built (plays keep
+their account; `engagements`, seeds and Seerr-request seeds are grouped under the canonical id), a
+pooled member is not ranked or labelled on its own, and both `/v1/recommend` and `/api/suggestions`
+answer a member with the canonical's lists (`trace.answered_as`; `trace.identity_pending` while the
+rebuild for a changed map has not landed). On `/v1/recommend` every account in a group gets the same
+household counts plus `household.group`, so the counts cannot tell the profiles apart: Shortlist's
+per-person household override (Kids=kids, Adults=family) is what does, and `group` exists so the fork
+can warn when two grouped accounts are left unpinned (fork py.7). `/api/suggestions` has no such
+override — a Kids profile asking it gets the household's list under `family=exclude`, i.e. the
+adults' — which only matters if picks.py is ever revived. Unset is a strict no-op; a changed map
+rebuilds at start (`engine_meta.identity_groups`); a malformed one stops the service at start, and a
+build REFUSES a map whose canonical account Tautulli does not know (one mistyped digit would
+otherwise leave the household with no lists and nothing to say why). Ids are ASCII digits above zero.
+`python -m engine check-groups` validates the variable and prints the groups without building
+(exit 0 ok, 2 malformed, 3 canonical unknown; mount the data directory read-only). `python -m harness
+split` and the other offline harness commands build `engagements` UNPOOLED — do not run them against
+the engine's live data directory while a map is set.
 
 Household label (v0.3.0): the nightly build writes `households(plex_id, label, kids_share,
 kids_titles, window_titles)` from each person's last 12 months of positives (children's titles by

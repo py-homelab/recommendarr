@@ -30,8 +30,16 @@ CREATE TABLE engagements (
 );
 """
 
+# Accounts pooled under another (`engine.identity`): a household's Plex Home profiles count as one
+# person, so two episodes on one profile and one on another are three distinct episodes of one show.
+# Plays keep the account that made them; only this table groups them. Empty means nobody is pooled.
+ALIAS_SCHEMA = """
+CREATE TEMP TABLE IF NOT EXISTS identity_alias (member INTEGER PRIMARY KEY, canonical INTEGER NOT NULL);
+DELETE FROM identity_alias;
+"""
+
 ROWS_SQL = """
-SELECT p.user_id, t.tmdb_id, t.media_type,
+SELECT COALESCE(a.canonical, p.user_id) AS user_id, t.tmdb_id, t.media_type,
        MIN(CASE WHEN p.watched_status = 1 THEN p.date END) AS first_completed,
        MIN(p.date) AS first_play,
        MAX(p.date) AS last_at,
@@ -41,8 +49,9 @@ SELECT p.user_id, t.tmdb_id, t.media_type,
        AVG(p.product LIKE '%TV%' OR p.player LIKE '%BRAVIA%' OR p.platform IN ('Roku', 'tvOS', 'webOS', 'Tizen', 'Vizio Blink', 'Android TV')) AS tv_share
 FROM plays p
 JOIN titles t ON t.rating_key = COALESCE(p.grandparent_rating_key, p.rating_key)
+LEFT JOIN identity_alias a ON a.member = p.user_id
 WHERE t.tmdb_id IS NOT NULL
-GROUP BY p.user_id, t.tmdb_id, t.media_type
+GROUP BY COALESCE(a.canonical, p.user_id), t.tmdb_id, t.media_type
 """
 
 
@@ -73,9 +82,12 @@ def seed_weight(row, cutoff: int) -> float:
     return row["engagement"] * min(rewatch, 2.0) * recency_weight(row["first_at"], cutoff)
 
 
-def run(con) -> None:
+def run(con, aliases: dict[int, int] | None = None) -> None:
+    """`aliases` is member id -> canonical id; a member's plays count as the canonical's."""
     now = int(time.time())
     con.executescript(SCHEMA)
+    con.executescript(ALIAS_SCHEMA)
+    con.executemany("INSERT INTO identity_alias VALUES (?, ?)", list((aliases or {}).items()))
     rows = []
     for r in con.execute(ROWS_SQL):
         engagement, label = classify(

@@ -14,6 +14,8 @@ import numpy as np
 from harness import blend, catalogue, content, data, engagement, graph, llm, movielens, pull, resolve, signals, tmdb, tune
 from harness.data import Key, Seed, UserContext
 
+from . import identity
+
 MIN_SEEDS = 3                 # below this a user gets the household/popularity fallback
 LIST_SIZE = 300               # the missing surface; the library surface ranks the whole library
 NEIGHBOURS = 100              # per library title, for rows focused on one or a few watches
@@ -122,7 +124,10 @@ def write_households(con, items, built_at: int) -> dict[int, str]:
         c[1] += int(signals.is_kids(it))
     con.execute("DELETE FROM households")
     labels = {}
+    pooled = identity.members()
     for (u,) in con.execute("SELECT user_id FROM users"):
+        if u in pooled:
+            continue  # answered with the canonical's row — see `identity`
         total, kids = counts.get(u, [0, 0])
         labels[u] = household_label(total, kids)
         con.execute(
@@ -175,7 +180,11 @@ def contexts_now(con, items, surface="missing") -> dict[int, UserContext]:
             if it.in_catalogue and k not in unavailable and it.release_date
             and it.release_date <= (movie_limit if k[1] == "movie" else show_limit)
         }
-    users = [r["user_id"] for r in con.execute("SELECT user_id FROM users")]
+    # A pooled member has no list of its own: its plays are the canonical's, and its lookups are
+    # answered with the canonical's lists (`identity`). Ranking it separately would write a
+    # popularity list for an account with "no history" and count one household as several people.
+    pooled = identity.members()
+    users = [r["user_id"] for r in con.execute("SELECT user_id FROM users") if r["user_id"] not in pooled]
     return data._contexts(con, users, now, universe)
 
 
@@ -233,20 +242,61 @@ def explain(space: content.ItemSpace, ctx: UserContext, key: Key, items, continu
     ]
 
 
+def check_identity(con) -> None:
+    """Refuse to build on a map whose canonical account Tautulli does not know; say so for a member.
+
+    A canonical that is not in `users` is never ranked, and its members are skipped BECAUSE they are
+    pooled — so one mistyped digit leaves a whole household with no lists on either surface and no
+    household label, and nothing anywhere says why: the callers just fall back. Refusing keeps last
+    night's lists in place and puts the reason in the build log and `/healthz`. An unknown MEMBER is
+    ordinary (a new profile nobody has watched on yet) and only worth a line.
+    """
+    canonicals, members = identity.unknown_ids(con)
+    for plex_id in members:
+        print(f"identity: member {plex_id} has no plays yet — pooled, nothing to add")
+    if canonicals:
+        raise ValueError(
+            f"{identity.ENV}: canonical account {canonicals[0]} is not a user Tautulli knows — check the id. "
+            "Building with it would leave that household with no lists at all."
+        )
+
+
+def record_meta(con, version: str, pooled: dict[int, int]) -> None:
+    """What made this build, so a start under something else rebuilds: the engine version, and the
+    identity map it pooled accounts by (the service compares both — `service.nightly`)."""
+    con.executescript(META_SCHEMA)
+    con.execute("INSERT OR REPLACE INTO engine_meta VALUES ('built_by', ?)", (version,))
+    con.execute("INSERT OR REPLACE INTO engine_meta VALUES ('identity_groups', ?)", (identity.normalised(pooled),))
+
+
+def pooled_requests(requests: dict, pooled: dict[int, int]) -> dict:
+    """A member's own Seerr requests seed the canonical's ranking, like its plays do."""
+    merged: dict[int, dict] = {}
+    for user_id, rows in requests.items():
+        mine = merged.setdefault(pooled.get(user_id, user_id), {})
+        for key, created_at in rows:
+            # Once per title, at its EARLIEST request: two profiles asking for the same show (two
+            # seasons of it, say) is one statement of intent, not a seed of twice the weight.
+            mine[key] = min(created_at, mine.get(key, created_at))
+    return {user_id: list(rows.items()) for user_id, rows in merged.items()}
+
+
 def build(con, version: str = "") -> None:
     started = time.time()
     calls0 = tmdb.network_calls
     con.executescript(SCHEMA)
     con.executescript(HOUSEHOLD_SCHEMA)
+    pooled = identity.members()  # raises on a malformed map, before anything is rebuilt
     pull.run(con)
+    check_identity(con)
     resolve.run(con)
-    engagement.run(con)
+    engagement.run(con, pooled)
     refresh_catalogue(con)
 
     items = data.load_items(con)
     embeddings = llm.EmbeddingSpace(con, items)
     embeddings = embeddings if len(embeddings.keys) else None
-    scorer = signals.IntentSeeds(tune.final_blend(embeddings), signals.requests_by_user(con))
+    scorer = signals.IntentSeeds(tune.final_blend(embeddings), pooled_requests(signals.requests_by_user(con), pooled))
     # `prepare` builds the cross-user state (the household, the EASE fold-in) from the contexts'
     # seeds, which are the same on both surfaces — only the candidate universe differs.
     contexts = contexts_now(con, items, "missing")
@@ -270,8 +320,7 @@ def build(con, version: str = "") -> None:
         users = len(contexts)
     seconds = time.time() - started
     con.execute("INSERT INTO builds VALUES (?,?,?,?)", (built_at, users, seconds, tmdb.network_calls - calls0))
-    con.executescript(META_SCHEMA)
-    con.execute("INSERT OR REPLACE INTO engine_meta VALUES ('built_by', ?)", (version,))
+    record_meta(con, version, pooled)
     con.commit()
     print(f"built {users} users x {len(SURFACES)} surfaces in {seconds:.0f}s, {tmdb.network_calls - calls0} TMDb calls, "
           f"{datetime.fromtimestamp(built_at, timezone.utc):%Y-%m-%d %H:%M}Z")
