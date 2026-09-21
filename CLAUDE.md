@@ -267,7 +267,7 @@ trusted-proxy sign-in, `missing` surface → `user_suggestions`, `/api/me*`, the
 retire-inbox (inbox + Radarr/Sonarr routing deleted, `requests.overseerr.*` → `seerr.*`), #4 household
 (per-person family households from the engine's counts + `family.*` thresholds + per-person override,
 `family=auto`, `auth.admin_hosts`, JWT proxy sign-in). Released as `v1.9.1-py.1` →
-`ghcr.io/py-homelab/shortlist:1.9.1-py.1` (app version `1.9.1+py.1`). Upstream PRs to
+`ghcr.io/py-homelab/shortlist:1.9.1-py.1` (app version `1.9.1+py.1`). Later fork releases (all image-only, alembic head 0096): py.2–py.6 (row-setting compatibility, carried-pick family re-check, picks toasts, JWKS guard); **py.7** — a kids household's "auto" rows hold only children's titles (`rows._family_means`, recipe part `means=only`, emptied-row takedown, `household.group` + pooled-profile warning, `/me` narrowed for a kids account); **py.8** — watching-account copy narrowed by Plex `contentRating` for a children's profile (per-show visibility, play log narrowed too, planner-derived never-un-mark refusal). Upstream PRs to
 `stevezau/shortlist` `dev` would go in the same order. Its rules: engine never imports server, tests
 required and no network, migrations guarded and frozen (`scripts/check_migration_freeze.py --write`),
 OpenAPI snapshot + `pnpm -C web gen:api` after any route/version change,
